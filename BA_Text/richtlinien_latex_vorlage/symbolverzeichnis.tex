@@ -1,0 +1,52 @@
+\chapter*{Symbolverzeichnis}										% da *-Variante müssen Kopfzeilen und TOC-Eintrag von Hand generiert werden
+\markboth{Symbolverzeichnis}{Symbolverzeichnis} 				% Kopfzeile manuell anpassen 
+\addcontentsline{toc}{chapter}{Symbolverzeichnis}				% TOC-Eintrag
+
+
+
+\section*{Abkürzungen}
+
+%* Benutzung der Acronym-Umgebung
+%* \acrodef{Name zum aufrufen im Dokument}[gewünschte Abkürzung]{ausgeschriebener Begriff}
+%* \ac{Name} zur Verwendung im Dokument - beim 1.maligen Verwenden wird der ausgeschriebene
+%* Begriff mit der Abkürzung dahinter in Klammern gesetzt, danach nur noch die Abkürzung
+
+\acrodef{H2O}[$\mathrm{H_2O}$]{Wasser}
+\acrodef{RWTH}[RWTH Aachen]{Rheinisch-Westfälische Technische Hochschule Aachen}
+\acrodef{DPO}[DPO]{Diplomprüfungsordnung}
+
+%* \acs{Name} ruft explizit die Abkürzung auf.
+%* \acl{Name} ruft explizit den ausgeschriebenen Begriff auf.
+
+\begin{tabularx}{\textwidth}{p{.18\textwidth}X}
+\acs{H2O} & \acl{H2O} \\
+\acs{RWTH} & \acl{RWTH}\\
+\acs{DPO} & \acl{DPO}\\
+\end{tabularx}
+
+\section*{Physikalische Größen}
+
+\begin{tabularx}{\textwidth}{p{.18\textwidth}Xp{.1\textwidth}}
+$\mathrm{v}$ & Geschwindigkeit & $\frac{km}{h}$ \\
+$\mathrm{t}$ & Zeit & $h$\\
+\end{tabularx}
+
+\section*{Mathematische Größen}
+
+\begin{tabularx}{\textwidth}{p{.18\textwidth}X}
+$\mathrm{M}$ & mathematische Beispielgröße \\
+\end{tabularx}
+
+\section*{Indizes}
+
+\begin{tabularx}{\textwidth}{p{.18\textwidth}X}
+$k$ & Anzahl der Prozeßschritte \\
+$P_{1}...P_{n}$ & Prozeßschritt $P_{1}$ bis $P_{n}$\\
+$V_{Ziel}$ &  Zielvektor\\
+\end{tabularx}
+
+\section*{Konstanten}
+
+\begin{tabularx}{\textwidth}{p{.18\textwidth}X}
+$\pi$ & 3.141592653589 \\
+\end{tabularx}

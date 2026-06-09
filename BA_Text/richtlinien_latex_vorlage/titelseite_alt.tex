@@ -1,0 +1,54 @@
+%***********************************************************************
+%* File            :    titel.tex
+%*
+%* Titelseite 		 
+%*
+%* Autor           :    Daniel Hering
+%***********************************************************************
+
+
+
+\let\savedbaselinestretch=\baselinestretch    % Probleme mit geandertem 
+                                              % baselinestretch umgehen
+\renewcommand{\baselinestretch}{1}%
+\begin{titlepage}
+
+%***********************************************************************
+%* Definition der Kopfzeile																						 *
+%***********************************************************************
+
+\titlehead{\vspace*{-15mm}\underline{\parbox[b]{\textwidth}{\includegraphics[height=24pt]{images/rwth_logo_blau_rechts}\parbox[b]{0.632\textwidth}{\raggedleft\textcolor{rwthblue}{\footnotesize{HELMHOLTZ-INSTITUT F‹R BIOMEDIZINISCHE TECHNIK\\DER RWTH AACHEN}}}\includegraphics[height=24pt]{images/hia_logo_blau}}}\\\underline{\parbox[b]{\textwidth}{LEHRSTUHL F‹R MEDIZINISCHE INFORMATIONSTECHNIK\\Univ.-Prof. Dr.-Ing. Dr. med. Steffen Leonhardt}}}
+
+%***********************************************************************
+%* Ende der Definition der Kopfzeile																	 *
+%***********************************************************************
+
+\subject{\vspace*{2\baselineskip}}
+\title{\docshorttitle}
+\author{
+  \parbox{.8\linewidth}{%
+     \centering\docauthor\\%
+\vspace{0.7em}
+\large Betreuer/-in: \docsupervisor\\
+ \date{\large \today}
+}
+}%
+
+\publishers{\small\vspace*{\stretch{1000}}%
+  \parbox{\linewidth}{%
+  \vspace{10cm}
+    Pauwelsstraﬂe 20\\%
+    D-52074 Aachen\\%
+    Telefon: +49 (0)241 80 -23211\\%
+    Fax: +49 (0)241 80 -82442\\%
+    E-Mail: medit@hia.rwth-aachen.de\\%
+  }%
+  \vspace*{-\stretch{1}}%
+}
+\maketitle
+\thispagestyle{empty}
+\cleardoublepage
+\let\baselinestretch=\savedbaselinestretch%
+\end{titlepage}
+
+

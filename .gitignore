@@ -1,0 +1,15 @@
+data/
+results/
+.venv/
+**/__pycache__/
+
+# --- Ignore LaTeX Junk Files ---
+.hg/
+*.aux
+*.bbl
+*.blg
+*.fls
+*.log
+*.toc
+*.bak
+*.DS_Store
