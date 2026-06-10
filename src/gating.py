@@ -35,6 +35,13 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.compose import TransformedTargetRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.neural_network import MLPRegressor
+from xgboost import XGBRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import r2_score
 
 ORDER = ['cecg', 'ppg', 'bcg']   # feste Modalitäts-Reihenfolge
 
@@ -46,22 +53,16 @@ def make_gate(kind: str = 'mlp', hidden=(64, 32), alpha: float = 1e-3,
     Ein- und Ausgaben werden normalisiert (Ziel via TransformedTargetRegressor).
     """
     if kind == 'mlp':
-        from sklearn.neural_network import MLPRegressor
         reg = MLPRegressor(hidden_layer_sizes=hidden, activation='relu',
                            alpha=alpha, max_iter=800, random_state=random_state)
     elif kind == 'gb':
-        from sklearn.ensemble import HistGradientBoostingRegressor
-        from sklearn.multioutput import MultiOutputRegressor
         reg = MultiOutputRegressor(HistGradientBoostingRegressor(random_state=random_state))
     elif kind == 'ridge':
-        from sklearn.linear_model import Ridge
         reg = Ridge(alpha=1.0, random_state=random_state)
     elif kind == 'xgb':
         # XGBoost-Gate: gleiche Familie wie 'gb' (Gradient-Boosting-Bäume).
         # Hier nur, um Nicos Vorschlag empirisch zu prüfen — erwartungsgemäß
         # nahe an 'gb', da das Gate informations- und nicht modellbegrenzt ist.
-        from xgboost import XGBRegressor
-        from sklearn.multioutput import MultiOutputRegressor
         reg = MultiOutputRegressor(XGBRegressor(
             n_estimators=300, max_depth=3, learning_rate=0.05,
             subsample=0.8, colsample_bytree=0.8, random_state=random_state,
@@ -138,7 +139,6 @@ if __name__ == '__main__':
     gate.fit(SQI[:split], err_true[:split])
     err_hat = gate.predict(SQI[split:])
 
-    from sklearn.metrics import r2_score
     print('Gate R² je Modalität:',
           {m: round(r2_score(err_true[split:, i], err_hat[:, i]), 3) for i, m in enumerate(ORDER)})
 
