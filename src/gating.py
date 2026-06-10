@@ -56,8 +56,18 @@ def make_gate(kind: str = 'mlp', hidden=(64, 32), alpha: float = 1e-3,
     elif kind == 'ridge':
         from sklearn.linear_model import Ridge
         reg = Ridge(alpha=1.0, random_state=random_state)
+    elif kind == 'xgb':
+        # XGBoost-Gate: gleiche Familie wie 'gb' (Gradient-Boosting-Bäume).
+        # Hier nur, um Nicos Vorschlag empirisch zu prüfen — erwartungsgemäß
+        # nahe an 'gb', da das Gate informations- und nicht modellbegrenzt ist.
+        from xgboost import XGBRegressor
+        from sklearn.multioutput import MultiOutputRegressor
+        reg = MultiOutputRegressor(XGBRegressor(
+            n_estimators=300, max_depth=3, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, random_state=random_state,
+            n_jobs=1, tree_method='hist'))
     else:
-        raise ValueError("kind muss 'mlp', 'gb' oder 'ridge' sein")
+        raise ValueError("kind muss 'mlp', 'gb', 'ridge' oder 'xgb' sein")
 
     inner = Pipeline([('imp', SimpleImputer(strategy='median')),
                       ('sc',  StandardScaler()),
