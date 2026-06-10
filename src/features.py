@@ -582,7 +582,7 @@ def af_rr_heartpy(signal, fs, prefix=''):
 
 
 def af_rr_bcg(signal, fs, prefix=''):
-    return af_rr_from_detector(signal, fs, detect_peaks_bcg_cwt, prefix=prefix, cv_max=0.20)
+    return af_rr_from_detector(signal, fs, detect_peaks_bcg_cwt, prefix=prefix, cv_max=NONE) # cv_max=0.20
 
 
 def af_rr_cecg_cwt(signal, fs, prefix=''):
