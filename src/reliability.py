@@ -93,7 +93,12 @@ def modality_rr_ms(signal, fs, modality: str):
     if modality == 'ppg':
         return F._rr_ms_heartpy(signal, fs)
     if modality == 'bcg':
-        return F._rr_ms_from_detector(signal, fs, F.detect_peaks_bcg_cwt, cv_max=0.20)
+        # cv_max=None: EXAKT wie die Experten-Features. extract.py nutzt für BCG
+        # 'af_rr_bcg_nogate'/'hrv_bcg_nogate' -> detect_peaks_bcg_cwt OHNE cv-Gate.
+        # Mit cv_max=0.20 wäre die BCG-RR des Ziels strenger gefiltert als die, die
+        # der Experte sieht -> Ziel und Experten-Sichtweise inkonsistent (verletzt die
+        # Zusage oben: "mit DENSELBEN Detektoren wie die Features"). Daher None.
+        return F._rr_ms_from_detector(signal, fs, F.detect_peaks_bcg_cwt, cv_max=None)
     raise ValueError(f"Unbekannte Modalität '{modality}'")
 
 
