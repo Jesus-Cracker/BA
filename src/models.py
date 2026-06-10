@@ -127,7 +127,7 @@ def make_pipelines(balanced=False, random_state=RANDOM_STATE, scale_pos_weight=1
         _steps = list(_pipe.steps)
         _i = next(k for k, (n, _) in enumerate(_steps) if n == 'imp') + 1
         _steps.insert(_i, ('fs', SelectFromModel(
-            RandomForestClassifier(n_estimators=200, random_state=random_state, n_jobs=-1),
+            RandomForestClassifier(n_estimators=50, random_state=random_state, n_jobs=1),
             threshold=0.008)))
         pipes[_name] = Pipeline(_steps)
     return pipes

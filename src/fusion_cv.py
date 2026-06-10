@@ -73,13 +73,27 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
                  clf_per_modality: dict | None = None, gate_kind: str = 'mlp',
                  target_metric: str = 'target', inner_splits: int = 5,
                  min_spec: float = 0.80, random_state: int = 42,
-                 return_arrays: bool = False):
+                 freeze_weights: bool = False,
+                 return_arrays: bool = False, return_weights: bool = False):
     """
     Fensterweise AF-Auswertung der Mixture of Experts in patientenweiser LOPO-CV.
 
     gate_kind : 'mlp' | 'gb' | 'ridge'  -> gelerntes Gate (B)
                 'equal'                  -> Gleichgewichts-Baseline (naive Fusion)
-    Rückgabe  : (metrics_dict, mean_threshold[, y_true, y_prob, y_pred])
+
+    freeze_weights : nur für gelernte Gates. Das Gate wird wie gewohnt trainiert,
+        aber statt der FENSTERWEISEN Gewichte wird je Fold das mittlere
+        Trainingsgewicht (Spaltenmittel) eingefroren und KONSTANT auf alle
+        Test-Fenster angewendet. Das isoliert exakt den Beitrag der
+        fensterweisen SQI-Adaptivität: gefroren vs. gelernt = was die
+        Pro-Fenster-Anpassung tatsächlich bringt. (Bei 'equal' wirkungslos.)
+
+    return_weights : hängt zusätzlich die fensterweise Gewichtsmatrix yw (n, 3)
+        in Reihenfolge G.ORDER an die Rückgabe an (für die Adaptivitäts-Diagnose).
+
+    Rückgabe : (metrics_dict, mean_threshold
+                [, y_true, y_prob, y_pred, y_groups]      falls return_arrays
+                [, y_weights]                              falls return_weights)
     """
     y = np.asarray(y)
     groups = np.asarray(groups)
@@ -87,7 +101,7 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
     gate_cols = E.gate_sqi_cols(df, 'all')
     logo = LeaveOneGroupOut()
 
-    yt, yp, yd, yg, used_t = [], [], [], [], []
+    yt, yp, yd, yg, used_t, wt = [], [], [], [], [], []
     for tr, te in logo.split(df, y, groups):
         df_tr, df_te = df.iloc[tr], df.iloc[te]
         y_tr, g_tr = y[tr], groups[tr]
@@ -98,6 +112,7 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
         P_tr = G.probs_matrix(oof_tr)
 
         # 3/4) Gate fitten + Trainingsgewichte + Schwelle
+        w_const = None
         if gate_kind == 'equal':
             w_tr = G.equal_weights(len(df_tr))
             gate, scale = None, None
@@ -108,6 +123,10 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
             err_tr = gate.predict(df_tr[gate_cols].values)
             scale = float(np.nanmedian(err_tr)) + 1e-6   # feste Temperatur aus Training
             w_tr = G.errors_to_weights(err_tr, scale=scale)
+            if freeze_weights:
+                # mittleres Trainingsgewicht je Modalität einfrieren (keine Pro-Fenster-Variation)
+                w_const = w_tr.mean(axis=0, keepdims=True)
+                w_tr = np.repeat(w_const, len(df_tr), axis=0)
 
         fused_tr = G.fuse(w_tr, P_tr)
         t = M.choose_threshold(y_tr, fused_tr, min_spec)
@@ -117,19 +136,24 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
         P_te = G.probs_matrix(X.expert_probs(experts, df_te))
         if gate_kind == 'equal':
             w_te = G.equal_weights(len(df_te))
+        elif freeze_weights:
+            w_te = np.repeat(w_const, len(df_te), axis=0)   # eingefrorenes Trainingsmittel
         else:
             w_te = G.errors_to_weights(gate.predict(df_te[gate_cols].values), scale=scale)
         fused_te = G.fuse(w_te, P_te)
 
         yt.extend(y[te]); yp.extend(fused_te); yd.extend((fused_te >= t).astype(int))
-        yg.extend(groups[te]); used_t.append(t)
+        yg.extend(groups[te]); used_t.append(t); wt.extend(w_te)
 
     yt, yp, yd = map(np.array, (yt, yp, yd))
     yg = np.array(yg)
+    yw = np.asarray(wt, dtype=float)
     m = M.metrics(yt, yp, yd)
     out = (m, float(np.mean(used_t)))
     if return_arrays:
         out = out + (yt, yp, yd, yg)
+    if return_weights:
+        out = out + (yw,)
     return out
 
 
@@ -147,6 +171,88 @@ def compare_gates(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
                             gate_kind=gk, **kw)
         rows.append({'gate': gk, **m, 'threshold': round(t, 3)})
     return pd.DataFrame(rows)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Adaptivitäts-Diagnose: bringt die FENSTERWEISE SQI-Steuerung überhaupt etwas?
+# ──────────────────────────────────────────────────────────────────────────
+
+def compare_adaptivity(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
+                       base_gate: str = 'gb', clf_per_modality: dict | None = None,
+                       **kw) -> pd.DataFrame:
+    """
+    Kernprüfung der Track-B-Behauptung ("SQI steuert die Fusion PRO FENSTER").
+
+    Drei Varianten mit IDENTISCHEN Experten/Schwellen-Routinen, nur die Gewichte
+    unterscheiden sich:
+
+        equal      : feste 1/3-Gewichte (naive Fusion).
+        <base>-fix : dasselbe gelernte Gate, aber je Fold auf sein mittleres
+                     Trainingsgewicht EINGEFROREN — also feste, datengetriebene
+                     Modalitätsgewichte OHNE Pro-Fenster-Variation.
+        <base>-win : das volle gelernte Gate mit fensterweisen Gewichten.
+
+    Lesart der Tabelle:
+        Δ(equal → fix)  = Nutzen einer festen, gelernten Modalitäts-Umgewichtung.
+        Δ(fix → win)    = Nutzen der zusätzlichen FENSTERWEISEN SQI-Anpassung.
+    Ist Δ(fix → win) ~ 0, trägt die Pro-Fenster-Steuerung nichts bei und das
+    Ergebnis ist im Kern eine feste Gewichtung — das gehört dann ehrlich so in
+    die Diskussion (zusammen mit dem gate_weight_report, der dasselbe direkt an
+    der Gewichtsstreuung zeigt).
+    """
+    specs = [
+        ('equal',                 dict(gate_kind='equal')),
+        (f'{base_gate}-fix',      dict(gate_kind=base_gate, freeze_weights=True)),
+        (f'{base_gate}-win',      dict(gate_kind=base_gate, freeze_weights=False)),
+    ]
+    rows = []
+    for name, opt in specs:
+        m, t = evaluate_moe(df, rel, y, groups, clf_per_modality=clf_per_modality,
+                            **opt, **kw)
+        rows.append({'variant': name, **m, 'threshold': round(t, 3)})
+    return pd.DataFrame(rows)
+
+
+def gate_weight_report(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
+                       gate_kind: str = 'gb', clf_per_modality: dict | None = None,
+                       **kw):
+    """
+    Quantifiziert, WIE STARK das Gate seine Gewichte tatsächlich bewegt.
+
+    Liefert je Modalität:
+        mean_weight        mittleres Fusionsgewicht über alle Test-Fenster
+        std_overall        Streuung über ALLE Fenster (between- + within-Patient)
+        std_within_patient mittlere Streuung INNERHALB eines Patienten
+                           (= echte Pro-Fenster-Anpassung; das ist der Kernwert)
+        cv_within_patient  std_within_patient / mean_weight  (dimensionslos)
+
+    Interpretation: ist std_within_patient ~ 0 (bzw. cv_within_patient << 1),
+    variiert das Gewicht innerhalb eines Patienten kaum — das Gate reagiert dann
+    NICHT auf die fensterweise schwankende Signalqualität, sondern wirkt faktisch
+    wie eine feste (höchstens patientenweise) Gewichtung.
+
+    Rückgabe: (report_df, weights_df)   weights_df enthält w_<mod> + patient je Fenster.
+    """
+    res = evaluate_moe(df, rel, y, groups, clf_per_modality=clf_per_modality,
+                       gate_kind=gate_kind, return_arrays=True, return_weights=True, **kw)
+    yg, yw = res[5], res[6]                      # (..., y_groups, y_weights)
+    wcols = [f'w_{m}' for m in G.ORDER]
+    W = pd.DataFrame(yw, columns=wcols)
+    W['patient'] = yg
+
+    mean_w   = W[wcols].mean()
+    std_all  = W[wcols].std()
+    std_wp   = W.groupby('patient')[wcols].std().mean()   # über Patienten gemittelt
+    cv_wp    = std_wp / mean_w.replace(0, np.nan)
+
+    rep = pd.DataFrame({
+        'mean_weight':        mean_w,
+        'std_overall':        std_all,
+        'std_within_patient': std_wp,
+        'cv_within_patient':  cv_wp,
+    })
+    rep.index = G.ORDER
+    return rep, W
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -190,4 +296,13 @@ if __name__ == '__main__':
                         inner_splits=3)
     cols = ['gate', 'AUC', 'Sensitivität', 'Spezifität', 'Accuracy', 'threshold']
     print('\n', tab[[c for c in cols if c in tab.columns]].round(3).to_string(index=False))
+
+    # Adaptivitäts-Diagnose (gefroren vs. fensterweise) + Gewichtsstreuung
+    adt = compare_adaptivity(df, rel, y, groups, base_gate='gb', inner_splits=3)
+    acols = ['variant', 'AUC', 'Sensitivität', 'Spezifität', 'Accuracy', 'threshold']
+    print('\n', adt[[c for c in acols if c in adt.columns]].round(3).to_string(index=False))
+
+    rep, W = gate_weight_report(df, rel, y, groups, gate_kind='gb', inner_splits=3)
+    print('\nGewichts-Report (gb):\n', rep.round(3).to_string())
+    assert rep['std_within_patient'].max() > 0, 'Gate sollte auf der Synthetik fensterweise variieren'
     print('\nSelbsttest OK (gelerntes Gate sollte BCG-Rauschen abwerten und equal schlagen).')
