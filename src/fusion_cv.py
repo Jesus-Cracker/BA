@@ -30,6 +30,9 @@ Leakage-Kontrolle auf beiden Ebenen:
 
 from __future__ import annotations
 
+import os
+import hashlib
+
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import LeaveOneGroupOut
@@ -38,6 +41,10 @@ import experts as X
 import gating as G
 import models as M
 import extract as E
+
+# Verzeichnis dieser Datei (src/) — robuste Pfadangabe für joblib/loky-Worker,
+# unabhängig vom Arbeitsverzeichnis des Notebooks.
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -74,7 +81,8 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
                  target_metric: str = 'target', inner_splits: int = 5,
                  min_spec: float = 0.80, random_state: int = 42,
                  freeze_weights: bool = False,
-                 return_arrays: bool = False, return_weights: bool = False):
+                 return_arrays: bool = False, return_weights: bool = False,
+                 fold_cache: dict | None = None):
     """
     Fensterweise AF-Auswertung der Mixture of Experts in patientenweiser LOPO-CV.
 
@@ -91,6 +99,16 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
     return_weights : hängt zusätzlich die fensterweise Gewichtsmatrix yw (n, 3)
         in Reihenfolge G.ORDER an die Rückgabe an (für die Adaptivitäts-Diagnose).
 
+    fold_cache : OPTIONAL. Ergebnis von `precompute_folds(...)`. Enthält je äußerem
+        Fold die bereits berechnete (TEURE) Experten-Schicht — OOF-Trainings-Probs
+        `P_tr` und Test-Probs `P_te`. Da diese NUR von (Daten, clf_per_modality,
+        inner_splits, random_state, Fold-Split) abhängen und NICHT von
+        gate_kind/target_metric/freeze_weights, werden sie einmal berechnet und über
+        alle Gate-Varianten wiederverwendet (Faktor ~10 weniger Experten-Fits).
+        LECKAGE-SICHERUNG: der Cache trägt einen Hash seiner Eingänge; passt er nicht
+        EXAKT zu (df, y, groups, clf_per_modality, inner_splits, random_state), wird
+        er VERWORFEN (ValueError) statt stillschweigend falsch verwendet.
+
     Rückgabe : (metrics_dict, mean_threshold
                 [, y_true, y_prob, y_pred, y_groups]      falls return_arrays
                 [, y_weights]                              falls return_weights)
@@ -99,47 +117,60 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
     groups = np.asarray(groups)
     rel_al = align_reliability(df, rel)
     gate_cols = E.gate_sqi_cols(df, 'all')
-    logo = LeaveOneGroupOut()
+
+    # Quelle der (tr, te, P_tr, P_te) je Fold: entweder live berechnet (unveränderte
+    # Logik) ODER aus dem geprüften Cache. Der NACHGELAGERTE Code ist in beiden
+    # Fällen IDENTISCH -> Cache ändert das Ergebnis nicht, nur die Laufzeit.
+    if fold_cache is not None:
+        _verify_fold_cache(fold_cache, df, y, groups, clf_per_modality,
+                           inner_splits, random_state)
+        fold_iter = [(f['tr'], f['te'], f['P_tr'], f['P_te'])
+                     for f in fold_cache['folds']]
+    else:
+        logo = LeaveOneGroupOut()
+        fold_iter = []
+        for tr, te in logo.split(df, y, groups):
+            # 1) leckagefreie OOF-Experten-Probs auf den Trainingsfenstern
+            oof_tr = X.oof_expert_probs(df.iloc[tr], y[tr], groups[tr], clf_per_modality,
+                                        n_splits=inner_splits, random_state=random_state)
+            P_tr = G.probs_matrix(oof_tr)
+            # 5a) Experten auf ALLEN Trainingspatienten fitten, auf Test anwenden
+            experts = X.fit_experts(df.iloc[tr], y[tr], clf_per_modality,
+                                    random_state=random_state)
+            P_te = G.probs_matrix(X.expert_probs(experts, df.iloc[te]))
+            fold_iter.append((np.asarray(tr), np.asarray(te), P_tr, P_te))
 
     yt, yp, yd, yg, used_t, wt = [], [], [], [], [], []
-    for tr, te in logo.split(df, y, groups):
-        df_tr, df_te = df.iloc[tr], df.iloc[te]
-        y_tr, g_tr = y[tr], groups[tr]
+    for tr, te, P_tr, P_te in fold_iter:
+        y_tr = y[tr]
 
-        # 1) leckagefreie OOF-Experten-Probs auf den Trainingsfenstern
-        oof_tr = X.oof_expert_probs(df_tr, y_tr, g_tr, clf_per_modality,
-                                    n_splits=inner_splits, random_state=random_state)
-        P_tr = G.probs_matrix(oof_tr)
-
-        # 3/4) Gate fitten + Trainingsgewichte + Schwelle
+        # 3/4) Gate fitten + Trainingsgewichte + Schwelle  (billig, varianten-abhängig)
         w_const = None
         if gate_kind == 'equal':
-            w_tr = G.equal_weights(len(df_tr))
+            w_tr = G.equal_weights(len(tr))
             gate, scale = None, None
         else:
             T_tr = _prep_targets(rel_al.iloc[tr], target_metric)
             gate = G.make_gate(kind=gate_kind, random_state=random_state)
-            gate.fit(df_tr[gate_cols].values, T_tr)
-            err_tr = gate.predict(df_tr[gate_cols].values)
+            gate.fit(df.iloc[tr][gate_cols].values, T_tr)
+            err_tr = gate.predict(df.iloc[tr][gate_cols].values)
             scale = float(np.nanmedian(err_tr)) + 1e-6   # feste Temperatur aus Training
             w_tr = G.errors_to_weights(err_tr, scale=scale)
             if freeze_weights:
                 # mittleres Trainingsgewicht je Modalität einfrieren (keine Pro-Fenster-Variation)
                 w_const = w_tr.mean(axis=0, keepdims=True)
-                w_tr = np.repeat(w_const, len(df_tr), axis=0)
+                w_tr = np.repeat(w_const, len(tr), axis=0)
 
         fused_tr = G.fuse(w_tr, P_tr)
         t = M.choose_threshold(y_tr, fused_tr, min_spec)
 
-        # 5) Experten auf ALLEN Trainingspatienten neu fitten, auf Test anwenden
-        experts = X.fit_experts(df_tr, y_tr, clf_per_modality, random_state=random_state)
-        P_te = G.probs_matrix(X.expert_probs(experts, df_te))
+        # 5b) Testgewichte bestimmen (KEIN GT im Test!) und fusionieren
         if gate_kind == 'equal':
-            w_te = G.equal_weights(len(df_te))
+            w_te = G.equal_weights(len(te))
         elif freeze_weights:
-            w_te = np.repeat(w_const, len(df_te), axis=0)   # eingefrorenes Trainingsmittel
+            w_te = np.repeat(w_const, len(te), axis=0)   # eingefrorenes Trainingsmittel
         else:
-            w_te = G.errors_to_weights(gate.predict(df_te[gate_cols].values), scale=scale)
+            w_te = G.errors_to_weights(gate.predict(df.iloc[te][gate_cols].values), scale=scale)
         fused_te = G.fuse(w_te, P_te)
 
         yt.extend(y[te]); yp.extend(fused_te); yd.extend((fused_te >= t).astype(int))
@@ -155,6 +186,142 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
     if return_weights:
         out = out + (yw,)
     return out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Experten-Schicht cachen: einmal je Fold rechnen, über alle Gate-Varianten nutzen
+# ──────────────────────────────────────────────────────────────────────────
+
+def _expert_layer_signature(df: pd.DataFrame, y, groups, clf_per_modality,
+                            inner_splits: int, random_state: int) -> str:
+    """
+    Eindeutiger Hash GENAU der Eingänge, die P_tr/P_te bestimmen — also
+    Experten-Merkmale (Inhalt + Spaltennamen), Labels, Patienten-Gruppen,
+    Klassifikatorwahl, inner_splits, random_state. NICHT enthalten:
+    gate_kind, target_metric, freeze_weights, min_spec (verändern P_tr/P_te nicht).
+
+    Zweck = Leckage-/Korrektheits-Sicherung: ein Cache darf nur dann
+    wiederverwendet werden, wenn diese Eingänge BIT-genau übereinstimmen.
+    """
+    clf = clf_per_modality or X.DEFAULT_CLF
+    feat_cols = sorted({c for m in clf for c in E.expert_feature_cols(df, m)})
+    h = hashlib.sha1()
+    h.update('|'.join(feat_cols).encode())
+    h.update(np.ascontiguousarray(df[feat_cols].values, dtype=np.float64).tobytes())
+    h.update(np.asarray(y).astype(np.int64).tobytes())
+    h.update('|'.join(map(str, np.asarray(groups))).encode())
+    h.update(repr(sorted(clf.items())).encode())
+    h.update(f'{int(inner_splits)}|{int(random_state)}'.encode())
+    return h.hexdigest()[:16]
+
+
+def _fold_expert_layer(args):
+    """Worker (loky): rechnet die TEURE Experten-Schicht für EINEN Fold.
+    Gibt OOF-Trainings-Probs (n_tr, 3) und Test-Probs (n_te, 3) in G.ORDER zurück.
+    Identisch zur Live-Logik in evaluate_moe — nur ausgelagert & parallelisierbar."""
+    import sys
+    for p in [_SRC_DIR, 'src', '.', '../src']:
+        if os.path.isdir(p) and os.path.exists(os.path.join(p, 'features.py')):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+            break
+    import experts as _X
+    import gating as _G
+
+    df_tr, y_tr, g_tr, df_te, clf_per_modality, inner_splits, random_state = args
+    oof_tr = _X.oof_expert_probs(df_tr, y_tr, g_tr, clf_per_modality,
+                                 n_splits=inner_splits, random_state=random_state)
+    P_tr = _G.probs_matrix(oof_tr)
+    experts = _X.fit_experts(df_tr, y_tr, clf_per_modality, random_state=random_state)
+    P_te = _G.probs_matrix(_X.expert_probs(experts, df_te))
+    return np.asarray(P_tr, dtype=float), np.asarray(P_te, dtype=float)
+
+
+def precompute_folds(df: pd.DataFrame, y, groups, clf_per_modality: dict | None = None,
+                     inner_splits: int = 5, random_state: int = 42,
+                     n_jobs: int = -1, cache_dir: str | None = None,
+                     force: bool = False, verbose: bool = True) -> dict:
+    """
+    Berechnet die Experten-Schicht je LOPO-Fold EINMAL (parallel) und gibt einen
+    wiederverwendbaren Cache zurück. Anschließend laufen alle Gate-Varianten
+    (compare_gates, compare_adaptivity, gate_weight_report, evaluate_moe) über
+    denselben Cache — die teuren Experten-Fits entfallen dort komplett.
+
+    Leckagefrei: pro Fold wird die Experten-Schicht NUR aus den Trainingspatienten
+    dieses Folds gebildet (exakt wie bisher in evaluate_moe); es gibt KEIN globales
+    OOF, das einen Testpatienten einbeziehen könnte.
+
+    Parallelisierung: loky über die Folds, inner_max_num_threads=1 (kein
+    Thread-Oversubscribing der sklearn-Schätzer).
+
+    cache_dir : wenn gesetzt, wird der Cache als
+        f'fold_expert_cache_<sig>.joblib' gespeichert/geladen (Re-Runs sind dann
+        sofort). force=True erzwingt Neuberechnung.
+
+    Rückgabe (dict):
+        sig, clf, inner_splits, random_state,
+        folds = [ {tr, te, P_tr, P_te}, ... ]   (tr/te = Integer-Indizes in df)
+    """
+    y = np.asarray(y)
+    groups = np.asarray(groups)
+    sig = _expert_layer_signature(df, y, groups, clf_per_modality, inner_splits, random_state)
+
+    path = None
+    if cache_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        path = os.path.join(cache_dir, f'fold_expert_cache_{sig}.joblib')
+        if os.path.exists(path) and not force:
+            import joblib
+            if verbose:
+                print(f'Fold-Cache gefunden -> lade {path}')
+            return joblib.load(path)
+
+    logo = LeaveOneGroupOut()
+    folds = list(logo.split(df, y, groups))
+    if verbose:
+        print(f'Berechne Experten-Schicht für {len(folds)} Folds '
+              f'(sig={sig}, n_jobs={n_jobs}) ...')
+
+    tasks = [(df.iloc[tr], y[tr], groups[tr], df.iloc[te],
+              clf_per_modality, inner_splits, random_state) for tr, te in folds]
+
+    import time
+    from joblib import Parallel, delayed, parallel_config
+    t0 = time.time()
+    with parallel_config(backend='loky', n_jobs=n_jobs, inner_max_num_threads=1):
+        results = Parallel()(delayed(_fold_expert_layer)(a) for a in tasks)
+
+    fold_list = [{'tr': np.asarray(tr), 'te': np.asarray(te), 'P_tr': P_tr, 'P_te': P_te}
+                 for (tr, te), (P_tr, P_te) in zip(folds, results)]
+    cache = {'sig': sig, 'clf': clf_per_modality or X.DEFAULT_CLF,
+             'inner_splits': inner_splits, 'random_state': random_state,
+             'folds': fold_list}
+
+    if verbose:
+        print(f'  fertig in {time.time()-t0:.1f}s · {len(fold_list)} Folds')
+    if path is not None:
+        import joblib
+        joblib.dump(cache, path)
+        if verbose:
+            print(f'  gespeichert: {path}')
+    return cache
+
+
+def _verify_fold_cache(fold_cache: dict, df: pd.DataFrame, y, groups,
+                       clf_per_modality, inner_splits: int, random_state: int):
+    """Leckage-/Korrektheits-Sicherung: der Cache darf NUR bei bit-genauer
+    Übereinstimmung der Eingänge verwendet werden, sonst harter Abbruch."""
+    sig = _expert_layer_signature(df, np.asarray(y), np.asarray(groups),
+                                  clf_per_modality, inner_splits, random_state)
+    if fold_cache.get('sig') != sig:
+        raise ValueError(
+            "fold_cache passt NICHT zu (df, y, groups, clf_per_modality, inner_splits, "
+            "random_state) — er wurde mit anderen Eingängen gebaut. Zur Leckage-/"
+            "Korrektheits-Sicherung wird er NICHT verwendet. precompute_folds(...) mit "
+            "den AKTUELLEN Argumenten neu ausführen (ggf. force=True).")
+
+
+# ──────────────────────────────────────────────────────────────────────────
 
 
 def compare_gates(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
@@ -306,3 +473,89 @@ if __name__ == '__main__':
     print('\nGewichts-Report (gb):\n', rep.round(3).to_string())
     assert rep['std_within_patient'].max() > 0, 'Gate sollte auf der Synthetik fensterweise variieren'
     print('\nSelbsttest OK (gelerntes Gate sollte BCG-Rauschen abwerten und equal schlagen).')
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Stage 0.5 — Gate-Prädiktionsgüte: sagt der SQI das Zuverlässigkeits-Ziel überhaupt voraus?
+# ──────────────────────────────────────────────────────────────────────────
+
+def gate_predictive_validity(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
+                             gate_kind: str = 'gb', target_metric: str = 'cosen_err',
+                             random_state: int = 42) -> pd.DataFrame:
+    """
+    Wurzel-Ursachen-Diagnose VOR jeder Gewichtungs-Arbeit (Stage 0.5).
+
+    Frage: Trägt der SQI überhaupt Information über das Zuverlässigkeits-ZIEL?
+    Wenn nicht, ist der prädizierte Fehler quasi konstant, die Gewichte werden
+    flach, und KEINE Abbildung (Softmax oder Bachelets flat+exp) kann die Fusion
+    fensterweise steuern. Misst also die UPSTREAM-Ursache; cell 15/16 messen nur
+    die Downstream-Wirkung. Bachelets Fusion funktionierte, WEIL r(pred,true)=0.89.
+
+    Vorgehen (leckagefrei, LOPO): je äußerem Fold das Gate EXAKT wie in
+    `evaluate_moe` trainieren (Ziel via `_prep_targets`, 95-%-Sentinel für
+    ungültige Trainingsfenster) und den ausgelassenen Patienten vorhersagen.
+    Gemessen wird also der real eingesetzte Reliability-Prädiktor — kein
+    geschöntes Nur-gültig-Modell.
+
+    Bewertung NUR auf Test-Fenstern mit gültigem GT-Ziel
+    (`rel_<mod>_valid == True`); Sentinel-gefüllte Fenster sind ausgeschlossen,
+    sonst verzerrt die Füllung die Korrelation.
+
+    target_metric : 'cosen_err' (AF-Default) | 'drr_sd_err' | 'hr_err'
+                    (hier die ROHE Metrik-Spalte, nicht 'target').
+
+    Rückgabe (DataFrame, index = Modalität):
+        r                 Pearson-Korrelation prädizierter vs. wahrer Fehler
+        rho               Spearman-Rangkorrelation (monoton, robust)
+        R2_vs_train_mean  R² gegenüber der Konstanten-Baseline "Trainings-Mittel"
+                          (>0 = Gate schlägt die Konstante, ≤0 = nicht besser als konstant)
+        n_valid           Zahl der bewerteten Fenster (gültiges GT-Ziel)
+    """
+    from scipy.stats import pearsonr, spearmanr
+
+    if target_metric not in ('cosen_err', 'drr_sd_err', 'hr_err'):
+        raise ValueError("target_metric muss 'cosen_err', 'drr_sd_err' oder 'hr_err' sein "
+                         "(rohe Metrik, nicht 'target').")
+
+    y = np.asarray(y)
+    groups = np.asarray(groups)
+    rel_al = align_reliability(df, rel)
+    gate_cols = E.gate_sqi_cols(df, 'all')
+    logo = LeaveOneGroupOut()
+
+    acc = {m: {'true': [], 'pred': [], 'base': []} for m in G.ORDER}
+
+    for tr, te in logo.split(df, y, groups):
+        # Gate exakt wie im Einsatz trainieren (sentinel-gefülltes Ziel)
+        T_tr = _prep_targets(rel_al.iloc[tr], target_metric)
+        gate = G.make_gate(kind=gate_kind, random_state=random_state)
+        gate.fit(df.iloc[tr][gate_cols].values, T_tr)
+        err_hat = np.asarray(gate.predict(df.iloc[te][gate_cols].values), dtype=float)
+        tmean = T_tr.mean(axis=0)            # Konstanten-Baseline je Modalität (aus dem Training)
+
+        rel_te = rel_al.iloc[te].reset_index(drop=True)
+        for j, m in enumerate(G.ORDER):
+            valid  = (rel_te[f'rel_{m}_valid'] == True).to_numpy()
+            true_e = rel_te[f'rel_{m}_{target_metric}'].values.astype(float)
+            ok = valid & np.isfinite(true_e)
+            acc[m]['true'].append(true_e[ok])
+            acc[m]['pred'].append(err_hat[ok, j])
+            acc[m]['base'].append(np.full(int(ok.sum()), tmean[j]))
+
+    rows = []
+    for m in G.ORDER:
+        t = np.concatenate(acc[m]['true']) if acc[m]['true'] else np.array([])
+        p = np.concatenate(acc[m]['pred']) if acc[m]['pred'] else np.array([])
+        b = np.concatenate(acc[m]['base']) if acc[m]['base'] else np.array([])
+        n = int(len(t))
+        if n >= 3 and np.std(t) > 0 and np.std(p) > 0:
+            r   = float(pearsonr(p, t)[0])
+            rho = float(spearmanr(p, t).correlation)
+            ss_res = float(np.sum((t - p) ** 2))
+            ss_tot = float(np.sum((t - b) ** 2))     # vs. Trainings-Mittel
+            r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+        else:
+            r = rho = r2 = np.nan
+        rows.append({'modality': m, 'r': r, 'rho': rho,
+                     'R2_vs_train_mean': r2, 'n_valid': n})
+    return pd.DataFrame(rows).set_index('modality')
