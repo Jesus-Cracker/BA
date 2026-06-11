@@ -99,6 +99,54 @@ def _make_stacker(kind: str = 'logreg', random_state: int = 42):
     raise ValueError("stack_clf muss 'logreg' oder 'gb' sein")
 
 
+def _gate_trust_inner(df_tr, rel_tr, y_tr, g_tr, gate_kind, target_metric,
+                      gate_params, gate_cols, inner_splits, random_state,
+                      target_transform):
+    """Leckagefreies Gate-Vertrauen je Modalität (geclipptes OOF-R²), NUR auf den
+    Trainingspatienten eines äußeren Folds via inner GroupKFold. Gibt Array (K,) in
+    G.ORDER zurück (0 = Gate für diese Modalität nicht besser als konstant)."""
+    from sklearn.model_selection import GroupKFold
+    from sklearn.metrics import r2_score
+    Xall = df_tr[gate_cols].values
+    n_splits = min(inner_splits, len(np.unique(g_tr)))
+    if n_splits < 2:
+        return np.ones(len(G.ORDER))
+    folds = list(GroupKFold(n_splits=n_splits).split(df_tr, y_tr, g_tr))
+    acc = {m: {'t': [], 'p': []} for m in G.ORDER}
+    for itr, iva in folds:
+        T_itr = _prep_targets(rel_tr.iloc[itr], target_metric)
+        gate = G.make_gate(kind=gate_kind, random_state=random_state,
+                           target_transform=target_transform, **(gate_params or {}))
+        gate.fit(Xall[itr], T_itr)
+        pred = np.asarray(gate.predict(Xall[iva]), dtype=float)
+        rel_iva = rel_tr.iloc[iva].reset_index(drop=True)
+        for j, m in enumerate(G.ORDER):
+            valid = (rel_iva[f'rel_{m}_valid'] == True).to_numpy()
+            true_e = rel_iva[f'rel_{m}_{target_metric}'].values.astype(float)
+            ok = valid & np.isfinite(true_e)
+            acc[m]['t'].append(true_e[ok]); acc[m]['p'].append(pred[ok, j])
+    trust = []
+    for m in G.ORDER:
+        t = np.concatenate(acc[m]['t']) if acc[m]['t'] else np.array([])
+        p = np.concatenate(acc[m]['p']) if acc[m]['p'] else np.array([])
+        trust.append(max(0.0, float(r2_score(t, p))) if (len(t) >= 3 and np.std(t) > 0) else 0.0)
+    return np.asarray(trust, dtype=float)
+
+
+def _add_discordance(P):
+    """Diskordanz je Modalität = |p_m - Median der anderen|. Konsens-Information für
+    den FUSIONS-Layer (Stacking) — bewusst NICHT als Gate-Eingang (dort wäre es
+    AF-informativ -> konzeptuelle Leckage). Eingang P (n,K) in G.ORDER, Rückgabe
+    (n, 2K): [Probs | Diskordanzen]."""
+    P = np.asarray(P, dtype=float)
+    n, K = P.shape
+    disc = np.empty_like(P)
+    for j in range(K):
+        others = np.delete(P, j, axis=1)
+        disc[:, j] = np.abs(P[:, j] - np.median(others, axis=1))
+    return np.hstack([P, disc])
+
+
 def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
                  clf_per_modality: dict | None = None, gate_kind: str = 'mlp',
                  target_metric: str = 'target', inner_splits: int = 5,
@@ -107,6 +155,8 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
                  weight_map: str = 'softmax', map_params: dict | None = None,
                  fusion: str = 'weighted', stack_clf: str = 'logreg',
                  freeze_weights: bool = False,
+                 target_transform: str = 'standard', blend_trust: bool = False,
+                 stack_features: str = 'probs',
                  return_arrays: bool = False, return_weights: bool = False,
                  fold_cache: dict | None = None):
     """
@@ -121,6 +171,20 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
         Test-Fenster angewendet. Das isoliert exakt den Beitrag der
         fensterweisen SQI-Adaptivität: gefroren vs. gelernt = was die
         Pro-Fenster-Anpassung tatsächlich bringt. (Bei 'equal' wirkungslos.)
+
+    target_transform : Ziel-Transformation des Gates ('standard'|'quantile'|'log',
+        s. gating._target_transformer). 'quantile' nutzt die monotone rho>r-Struktur.
+
+    blend_trust : nur für gelernte Gates. Schätzt je äußerem Fold das Gate-Vertrauen
+        (geclipptes OOF-R² je Modalität, inner GroupKFold NUR auf Trainingspatienten)
+        und blendet die Gewichte modalitätsweise Richtung Gleichgewicht
+        (gating.blend_weights). Eine Modalität mit R²~0 fällt damit auf 1/K zurück
+        statt auf ein Rausch-Gewicht (graceful degradation; behebt PAT019-Fehlermode).
+
+    stack_features : nur für fusion='stacked'. 'probs' = Meta-Klassifikator auf
+        [p_cecg,p_ppg,p_bcg] (Default). 'probs+discord' hängt die Diskordanz jeder
+        Modalität zum Median der anderen an (|p_m - median(others)|) — der KONZEPTUELL
+        saubere Ort für Konsens-/Diskordanz-Information (Fusions-Layer, nicht Gate).
 
     return_weights : hängt zusätzlich die fensterweise Gewichtsmatrix yw (n, 3)
         in Reihenfolge G.ORDER an die Rückgabe an (für die Adaptivitäts-Diagnose).
@@ -177,6 +241,12 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
             # Gewichte, kein GT — direkt aufs AF-Ziel optimiert (LOPO-sauber).
             P_tr_a = np.asarray(P_tr, dtype=float)
             P_te_a = np.asarray(P_te, dtype=float)
+            if stack_features == 'probs+discord':
+                # Konsens-/Diskordanz-Info im Fusions-Layer (konzeptuell sauber, kein Gate-Leak)
+                P_tr_a = _add_discordance(P_tr_a)
+                P_te_a = _add_discordance(P_te_a)
+            elif stack_features != 'probs':
+                raise ValueError("stack_features muss 'probs' oder 'probs+discord' sein")
             meta = _make_stacker(stack_clf, random_state)
             meta.fit(P_tr_a, y_tr)
             fused_tr = meta.predict_proba(P_tr_a)[:, 1]
@@ -192,23 +262,34 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
             else:
                 T_tr = _prep_targets(rel_al.iloc[tr], target_metric)
                 gate = G.make_gate(kind=gate_kind, random_state=random_state,
-                                   **(gate_params or {}))
+                                   target_transform=target_transform, **(gate_params or {}))
                 gate.fit(df.iloc[tr][gate_cols].values, T_tr)
                 err_tr = gate.predict(df.iloc[tr][gate_cols].values)
+
+                # Optional: Gate-Vertrauen je Modalität (leckagefrei, inner GroupKFold
+                # NUR auf Trainingspatienten) -> Blend Richtung Gleichgewicht.
+                trust = None
+                if blend_trust:
+                    trust = _gate_trust_inner(df.iloc[tr], rel_al.iloc[tr], y_tr, groups[tr],
+                                              gate_kind, target_metric, gate_params, gate_cols,
+                                              inner_splits, random_state, target_transform)
 
                 # Fehler -> Gewicht: Abbildungs-Parameter NUR aus dem Training ableiten,
                 # dann IDENTISCH auf Train und Test anwenden (leckagefrei). 'softmax' =
                 # bisheriges Verhalten (Default, unverändert); 'exp' = Bachelet e0/τ (3.6.2).
                 if weight_map == 'softmax':
                     scale = float(np.nanmedian(err_tr)) + 1e-6   # feste Temperatur aus Training
-                    _map = lambda e: G.errors_to_weights(e, scale=scale)
+                    _raw = lambda e: G.errors_to_weights(e, scale=scale)
                 elif weight_map == 'exp':
                     mp = map_params or {}
                     e0 = float(mp.get('e0', np.nanpercentile(err_tr, 10)))
                     tau = float(mp.get('tau', np.nanmedian(err_tr) + 1e-6))
-                    _map = lambda e: G.errors_to_weights_exp(e, e0=e0, tau=tau)
+                    _raw = lambda e: G.errors_to_weights_exp(e, e0=e0, tau=tau)
                 else:
                     raise ValueError("weight_map muss 'softmax' oder 'exp' sein")
+
+                # R²-Blend Richtung Gleichgewicht (falls aktiviert) NACH der Abbildung
+                _map = (lambda e: G.blend_weights(_raw(e), trust)) if trust is not None else _raw
 
                 w_tr = _map(err_tr)
                 if freeze_weights:
@@ -536,7 +617,8 @@ if __name__ == '__main__':
 
 def gate_predictive_validity(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
                              gate_kind: str = 'gb', target_metric: str = 'cosen_err',
-                             random_state: int = 42) -> pd.DataFrame:
+                             random_state: int = 42,
+                             target_transform: str = 'standard') -> pd.DataFrame:
     """
     Wurzel-Ursachen-Diagnose VOR jeder Gewichtungs-Arbeit (Stage 0.5).
 
@@ -583,7 +665,8 @@ def gate_predictive_validity(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
     for tr, te in logo.split(df, y, groups):
         # Gate exakt wie im Einsatz trainieren (sentinel-gefülltes Ziel)
         T_tr = _prep_targets(rel_al.iloc[tr], target_metric)
-        gate = G.make_gate(kind=gate_kind, random_state=random_state)
+        gate = G.make_gate(kind=gate_kind, random_state=random_state,
+                           target_transform=target_transform)
         gate.fit(df.iloc[tr][gate_cols].values, T_tr)
         err_hat = np.asarray(gate.predict(df.iloc[te][gate_cols].values), dtype=float)
         tmean = T_tr.mean(axis=0)            # Konstanten-Baseline je Modalität (aus dem Training)

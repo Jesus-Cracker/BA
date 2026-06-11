@@ -79,6 +79,11 @@ MODALITIES = {
 # Welche SQIs pro Signal gespeichert werden (alle GT-frei -> als Gate-Eingang nutzbar)
 SQI_KEYS = ['kSQI', 'sSQI', 'pSQI', 'bSQI', 'tSQI', 'composite']
 
+# Feature-Version: geht in den Cache-Hash ein. Bei JEDER Änderung an der
+# Spaltenstruktur (neue Features) erhöhen -> alte Caches werden NICHT mehr
+# stillschweigend wiederverwendet (verhindert "fehlende Spalten"-Fehler).
+FEAT_VERSION = 'v3_acf_xmodal_xcorr'
+
 # Standard-Detektoren je Signal (entsprechen dem bisher besten Stand).
 # Es werden NAMEN (Strings) gespeichert, damit joblib/loky-Worker sie sicher
 # über `getattr(F, name)` auflösen können (Funktionsobjekte sind heikel zu picklen).
@@ -137,7 +142,8 @@ class ExtractConfig:
             [self.hrv_fn[s] for s in SIGNALS]
             + [self.af_rr_fn[s] for s in SIGNALS]
             + [str(self.use_af_rr), str(self.use_legacy_freq),
-               str(self.window_s), str(self.hop_s), str(self.min_valid_hrv)]
+               str(self.window_s), str(self.hop_s), str(self.min_valid_hrv),
+               FEAT_VERSION]
         )
         tag = self.hrv_fn['cecg'].replace('hrv_', '')
         h   = hashlib.sha1(cfg.encode()).hexdigest()[:6]
@@ -173,6 +179,7 @@ def extract_window(sig_windows: dict, fs: int,
     """
     feat = {}
     n_valid = 0
+    hr_per_signal = {}
     for s in SIGNALS:
         w = sig_windows[s]
 
@@ -190,11 +197,42 @@ def extract_window(sig_windows: dict, fs: int,
         for k in SQI_KEYS:
             feat[f'sqi_{s}_{k}'] = sq[k]
 
+        # GT-freie HR-Schätzung je Signal (für den multimodalen Konsens unten)
+        hr_per_signal[s] = Q.estimate_hr_fft(w, fs, band=Q.SQI_BANDS[SIG_TYPE[s]])
+
         # HRV-Gültigkeit (für n_valid_hrv / optionales Verwerfen)
         if np.isfinite(feat.get(f'{s}_meanRR', np.nan)):
             n_valid += 1
 
+    # --- Multimodale HR-Selbstkonsistenz (GT-FREI -> zusätzlicher Gate-Eingang) ---
+    # Einigen sich >=2 kontaktlose Signale auf dieselbe HR, ist das Fenster
+    # vertrauenswürdig — ohne Goldstandard. Bisher in sqi.py vorhanden, aber NICHT
+    # in der Tabelle. Spalten 'sqi_xmodal_*' werden von gate_sqi_cols('all') als
+    # Gate-Eingang aufgenommen (enden nicht auf '_composite').
+    xm = Q.cross_modal_hr_agreement(hr_per_signal, tol_bpm=10.0, min_agree=2)
+    feat['sqi_xmodal_n_agree']     = float(xm['n_agree'])
+    feat['sqi_xmodal_confidence']  = float(xm['confidence'])
+    feat['sqi_xmodal_trustworthy'] = float(bool(xm['trustworthy']))
+
+    # --- Inter-Kanal-Korrelation je Modalität (QUALITÄTS-Feature, AF-orthogonal) ---
+    # ppg1/ppg2 bzw. bcg1/bcg2 sehen dasselbe physiologische Signal. Hohe Korrelation
+    # = beide Kanäle erfassen konsistent dieselbe Wellenform (gute Qualität); sie
+    # bleibt auch bei AF hoch (gleicher, nur unregelmäßiger Puls in beiden Kanälen)
+    # -> erfüllt den "Phantom-Test" (perfektes SNR + irreguläre Schläge => weiterhin
+    # hoch) und ist damit ein sauberer GATE-Eingang, kein AF-Leck.
+    for mod, (a, b) in {'ppg': ('ppg1', 'ppg2'), 'bcg': ('bcg1', 'bcg2')}.items():
+        feat[f'sqi_{mod}_xcorr'] = _safe_xcorr(sig_windows[a], sig_windows[b])
+
     return feat, n_valid
+
+
+def _safe_xcorr(x, y):
+    """Pearson-Korrelation zweier Kanäle, robust (NaN/Konstanz -> 0.0)."""
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    if len(x) != len(y) or len(x) < 2 or np.std(x) == 0 or np.std(y) == 0:
+        return 0.0
+    c = np.corrcoef(x, y)[0, 1]
+    return float(c) if np.isfinite(c) else 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -348,6 +386,30 @@ def gate_sqi_cols(df: pd.DataFrame, kind: str = 'all') -> list:
         return [c for c in df.columns
                 if c.startswith('sqi_') and not c.endswith('_composite')]
     raise ValueError("kind muss 'all' oder 'composite' sein")
+
+
+def add_neighbor_context(df: pd.DataFrame, cols: list | None = None, k: int = 1) -> pd.DataFrame:
+    """Hängt je SQI-Spalte den Wert des VORIGEN und NÄCHSTEN Fensters DESSELBEN
+    Patienten an (zeitlicher Kontext -> Gewichts-Glättung). Neue Spalten heißen
+    '<col>_prev'/'<col>_next' und beginnen mit 'sqi_' -> werden automatisch von
+    gate_sqi_cols('all') als zusätzliche Gate-Eingänge aufgenommen.
+
+    Leckagefrei: der Shift erfolgt INNERHALB eines Patienten (groupby 'patient'),
+    am Rand wird mit dem eigenen Fensterwert aufgefüllt (kein Fremdpatient).
+    cols=None -> alle nicht-composite SQI-Spalten (die aktuellen Gate-Eingänge).
+    k -> Versatz in Fenstern (1 = direkte Nachbarn).
+    """
+    out = df.copy()
+    if cols is None:
+        cols = gate_sqi_cols(df, 'all')
+    cols = [c for c in cols if c in out.columns and c.startswith('sqi_')]
+    if 'win_idx' in out.columns:
+        out = out.sort_values(['patient', 'win_idx'])
+    g = out.groupby('patient', sort=False)
+    for c in cols:
+        out[f'{c}_prev'] = g[c].shift(k).fillna(out[c])
+        out[f'{c}_next'] = g[c].shift(-k).fillna(out[c])
+    return out.loc[df.index]
 
 
 def split_Xygroups(df: pd.DataFrame):

@@ -136,6 +136,59 @@ def frequency_domain_features_legacy(signal, fs, prefix):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# 2b. Detektionsfreie Rhythmus-Regularität (Autokorrelation)
+# ──────────────────────────────────────────────────────────────────────────
+
+ACF_KEYS = ['acf_peak', 'acf_bpm', 'acf_width']
+
+
+def autocorr_regularity(signal, fs, prefix='', hr_band=(0.6, 3.0)):
+    """
+    Detektionsfreie Rhythmus-Regularität über die Autokorrelation des Rohfensters.
+
+    Motivation: Für cECG/BCG ist die R-/J-Zacken-Detektion die eigentliche
+    Schwachstelle — schlägt sie fehl, sind ALLE RR-Features NaN/verrauscht. Dieses
+    Merkmal misst die Periodizität DIREKT am Fenster, ohne einen einzigen Peak zu
+    detektieren, und ist damit gerade für die schwachen Experten (cECG/BCG) ein
+    eigenständiger, robuster AF-Hinweis.
+
+    Sinusrhythmus -> scharfer, hoher ACF-Gipfel im Pulslag (acf_peak ~ 1, schmal);
+    AF (unregelmäßig) -> niedriger, breiter Gipfel (acf_peak klein, acf_width groß).
+
+    Liefert: acf_peak (Gipfelhöhe in [0,1]), acf_bpm (zugehörige HR), acf_width
+    (Halbwertsbreite des Gipfels in Lags -> Schärfemaß).
+    """
+    x = np.asarray(signal, dtype=float)
+    x = x - np.mean(x)
+    n = len(x)
+    keys = [f'{prefix}_{k}' for k in ACF_KEYS]
+    if n < fs or np.std(x) == 0:
+        return {k: np.nan for k in keys}
+    ac = np.correlate(x, x, mode='full')[n - 1:]
+    if ac[0] <= 0:
+        return {k: np.nan for k in keys}
+    ac = ac / ac[0]                                   # normiert: ac[0] = 1
+    lo = int(fs / hr_band[1]); hi = min(int(fs / hr_band[0]), n - 1)
+    if hi <= lo + 1:
+        return {k: np.nan for k in keys}
+    seg = ac[lo:hi]
+    k = lo + int(np.argmax(seg))
+    peak = float(ac[k])
+    bpm = float(60.0 * fs / k) if k > 0 else np.nan
+    # Halbwertsbreite des Gipfels (Lags mit ac > peak/2 um k herum)
+    half = peak / 2.0
+    l = k
+    while l > lo and ac[l] > half:
+        l -= 1
+    r = k
+    while r < hi and ac[r] > half:
+        r += 1
+    return {f'{prefix}_acf_peak': peak,
+            f'{prefix}_acf_bpm': bpm,
+            f'{prefix}_acf_width': float(r - l)}
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # 3. Entropie des Rohsignals
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -362,7 +415,9 @@ def hrv_cecg_cwt(signal, fs, prefix=''):
 # TPR→0.667 (zufällig), DFA-α1↓ (Richtung 0.5, unkorreliert).
 
 AF_RR_KEYS = ['CoSEn', 'rrShannon', 'TPR', 'DFA_a1',
-              'Lorenz_occ', 'Lorenz_origin', 'dRR_SD']
+              'Lorenz_occ', 'Lorenz_origin', 'dRR_SD',
+              # v2: robuste, detektor-rausch-tolerante RR-Streuungsmaße
+              'RR_CV', 'RMSSDn', 'dRR_MAD']
 
 
 def _sampen_counts(x, m, r):
@@ -531,7 +586,34 @@ def rr_af_feature_block(rr_ms, prefix=''):
         f'{p}DFA_a1':    dfa_alpha1(rr)                 if len(rr) >= 4 else np.nan,
     }
     block.update(poincare_lorenz_features(rr, prefix=prefix))
+    block.update(robust_rr_features(rr, prefix=prefix))
     return block
+
+
+def robust_rr_features(rr_ms, prefix=''):
+    """Robuste, detektor-rausch-tolerante RR-Streuungsmaße (v2).
+    Motivation: bei cECG/BCG erzeugt der Detektor gelegentlich Fehl-/Doppelschläge.
+    Mean/STD-basierte HRV reagiert darauf empfindlich; Median-/MAD-basierte Maße
+    sind robuster und bleiben für die AF-Diskrimination (RR-Streuung) aussagekräftig.
+      RR_CV   = SDNN/meanRR  (Variationskoeffizient, klassischer AF-Marker)
+      RMSSDn  = RMSSD/meanRR (skaleninvariante Kurzzeitvariabilität)
+      dRR_MAD = Median-Absolutabweichung von δRR [ms] (ausreißerrobust vs. dRR_SD)
+    """
+    p = f'{prefix}_' if prefix else ''
+    keys = [f'{p}RR_CV', f'{p}RMSSDn', f'{p}dRR_MAD']
+    rr = np.asarray(rr_ms, dtype=float) if rr_ms is not None else np.array([])
+    if len(rr) < 4:
+        return {k: np.nan for k in keys}
+    mean_rr = float(np.mean(rr))
+    if mean_rr <= 0:
+        return {k: np.nan for k in keys}
+    sdnn  = float(np.std(rr, ddof=1))
+    rmssd = float(np.sqrt(np.mean(np.diff(rr) ** 2)))
+    drr   = np.diff(rr)
+    mad   = float(np.median(np.abs(drr - np.median(drr)))) if len(drr) else np.nan
+    return {f'{p}RR_CV':   _finite(sdnn / mean_rr),
+            f'{p}RMSSDn':  _finite(rmssd / mean_rr),
+            f'{p}dRR_MAD': _finite(mad)}
 
 
 # ── RR-Quellen zum Einstecken (liefern RR-Serie in ms oder None) ───────────
@@ -582,7 +664,7 @@ def af_rr_heartpy(signal, fs, prefix=''):
 
 
 def af_rr_bcg(signal, fs, prefix=''):
-    return af_rr_from_detector(signal, fs, detect_peaks_bcg_cwt, prefix=prefix, cv_max=NONE) # cv_max=0.20
+    return af_rr_from_detector(signal, fs, detect_peaks_bcg_cwt, prefix=prefix, cv_max=None)
 
 
 def af_rr_cecg_cwt(signal, fs, prefix=''):
@@ -615,6 +697,7 @@ def signal_feature_block(signal, fs, prefix, hrv_fn=None, af_rr_fn=None,
     else:
         block.update(frequency_domain_features(signal, fs, prefix))
     block.update(sample_entropy_signal(signal, prefix))
+    block.update(autocorr_regularity(signal, fs, prefix))   # v2: detektionsfrei
 
     hrv = hrv_fn(signal, fs, prefix=prefix) if hrv_fn is not None else None
     for k in HRV_KEYS:
@@ -677,7 +760,8 @@ if __name__ == '__main__':
     print(f"  {'Feature':<14}{'Sinus':>10}{'AF':>10}   erwartet")
     richtung = {'x_CoSEn': 'AF↑', 'x_rrShannon': 'AF↑', 'x_TPR': 'AF→0.667',
                 'x_DFA_a1': 'AF↓', 'x_Lorenz_occ': 'AF↑',
-                'x_Lorenz_origin': 'AF↓', 'x_dRR_SD': 'AF↑'}
+                'x_Lorenz_origin': 'AF↓', 'x_dRR_SD': 'AF↑',
+                'x_RR_CV': 'AF↑', 'x_RMSSDn': 'AF↑', 'x_dRR_MAD': 'AF↑'}
     for k in bs:
         print(f"  {k:<14}{bs[k]:>10.3f}{ba[k]:>10.3f}   {richtung[k]}")
     assert ba['x_CoSEn'] > bs['x_CoSEn'], "CoSEn-Richtung falsch"

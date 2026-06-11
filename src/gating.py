@@ -165,12 +165,44 @@ class TorchMLPRegressor(BaseEstimator, RegressorMixin):
         return out.ravel() if self.n_outputs_ == 1 else out
 
 
+def _target_transformer(target_transform: str = 'standard'):
+    """Ziel-Transformer für den TransformedTargetRegressor des Gates.
+
+    Motiviert durch rho > r in der Prädiktionsgüte (monotoner, aber nicht-linearer
+    Zusammenhang SQI->Fehler) und durch die schwere Schiefe der Fehlerverteilungen:
+      'standard'  StandardScaler (bisheriges Verhalten, unverändert).
+      'quantile'  QuantileTransformer (rangbasiert -> Normalverteilung). Lernt auf
+                  den RÄNGEN des Fehlers -> nutzt genau die monotone Struktur, die
+                  rho zeigt; robust gegen Ausreißer/Heavy-Tails.
+      'log'       log1p dann StandardScaler — komprimiert Heavy-Tails (Fehler >= 0),
+                  inverse via expm1.
+    Die Rücktransformation (predict) liefert in allen Fällen Werte in Original-Fehler-
+    einheiten zurück -> die nachgelagerte Fehler->Gewicht-Abbildung bleibt unverändert.
+    """
+    if target_transform == 'standard':
+        return StandardScaler()
+    if target_transform == 'quantile':
+        from sklearn.preprocessing import QuantileTransformer
+        return QuantileTransformer(output_distribution='normal',
+                                   n_quantiles=256, subsample=100_000,
+                                   random_state=0)
+    if target_transform == 'log':
+        from sklearn.preprocessing import FunctionTransformer
+        return FunctionTransformer(func=np.log1p, inverse_func=np.expm1,
+                                   check_inverse=False)
+    raise ValueError("target_transform muss 'standard', 'quantile' oder 'log' sein")
+
+
 def make_gate(kind: str = 'mlp', hidden=(64, 32), alpha: float = 1e-3,
-              random_state: int = 42, **gate_kw):
+              random_state: int = 42, target_transform: str = 'standard', **gate_kw):
     """
     Multi-Output-Regressor: SQI-Vektor -> [err_cecg, err_ppg, err_bcg].
     Ein- und Ausgaben werden normalisiert (Ziel via TransformedTargetRegressor).
+
+    target_transform : Ziel-Transformation ('standard'|'quantile'|'log'), s.
+        _target_transformer. 'quantile' nutzt die monotone (rho>r) Struktur direkt.
     """
+    ttf = _target_transformer(target_transform)
     if kind == 'mlp':
         reg = MLPRegressor(hidden_layer_sizes=hidden, activation='relu',
                            alpha=alpha, max_iter=800, random_state=random_state)
@@ -204,7 +236,7 @@ def make_gate(kind: str = 'mlp', hidden=(64, 32), alpha: float = 1e-3,
                     dropout=gate_kw.get('dropout', 0.0),
                     val_frac=gate_kw.get('val_frac', 0.15),
                     random_state=random_state))]),
-            transformer=StandardScaler())
+            transformer=ttf)
     else:
         raise ValueError("kind muss 'mlp', 'gb', 'ridge', 'xgb' oder 'torch_mlp' sein")
 
@@ -212,7 +244,7 @@ def make_gate(kind: str = 'mlp', hidden=(64, 32), alpha: float = 1e-3,
                       ('sc',  StandardScaler()),
                       ('reg', reg)])
     # Ziel ebenfalls normalisieren (Fehlerwerte verschiedener Modalitäten skalieren unterschiedlich)
-    return TransformedTargetRegressor(regressor=inner, transformer=StandardScaler())
+    return TransformedTargetRegressor(regressor=inner, transformer=ttf)
 
 
 def errors_to_weights(err_hat, scale: float | None = None, eps: float = 1e-6):
@@ -235,6 +267,38 @@ def errors_to_weights(err_hat, scale: float | None = None, eps: float = 1e-6):
     return w
 
 
+def blend_weights(w_gate, gate_trust, eps: float = 1e-6):
+    """Blendet eine fertige Gewichtsmatrix modalitätsweise Richtung Gleichgewicht.
+
+    Motivation (erklärt den PAT019-Fehlermode): sagt das Gate den Zuverlässigkeits-
+    fehler einer Modalität NICHT vorher (R² ~ 0), ist ihr err_hat praktisch Rauschen
+    und das daraus berechnete Gewicht zufällig — die Fusion merkt das nicht. Statt
+    einem Rausch-Gewicht zu vertrauen, wird je Modalität mit dem Gleichgewicht (1/K)
+    gemischt, gewichtet mit dem VERTRAUEN (geclipptes Gate-R² je Modalität):
+
+        w = trust ⊙ w_gate + (1 − trust) ⊙ w_equal   (danach zeilenweise renormiert)
+
+    trust=1 -> volles Gate-Gewicht; trust=0 -> Gleichgewicht (graceful degradation).
+    gate_trust: Array der Länge K (Modalitäten in ORDER), aus leckagefreiem R².
+    """
+    w_gate = np.asarray(w_gate, dtype=float)
+    if w_gate.ndim == 1:
+        w_gate = w_gate[None, :]
+    K = w_gate.shape[1]
+    w_equal = np.full_like(w_gate, 1.0 / K)
+    trust = np.clip(np.asarray(gate_trust, dtype=float), 0.0, 1.0).reshape(1, -1)
+    w = trust * w_gate + (1.0 - trust) * w_equal
+    return w / (w.sum(axis=1, keepdims=True) + eps)
+
+
+def errors_to_weights_blended(err_hat, gate_trust, scale: float | None = None,
+                              eps: float = 1e-6):
+    """Softmax-Fehler->Gewicht (errors_to_weights) + R²-Blend Richtung Gleichgewicht.
+    Bequemer Einzelaufruf; identisch zu blend_weights(errors_to_weights(...), trust)."""
+    return blend_weights(errors_to_weights(err_hat, scale=scale, eps=eps),
+                         gate_trust, eps=eps)
+
+
 def errors_to_weights_exp(err_hat, e0: float, tau: float, eps: float = 1e-6):
     """
     Bachelet-Abbildung (3.6.2) Fehler -> Gewicht, zeilenweise normiert (Σ=1):
@@ -254,6 +318,7 @@ def errors_to_weights_exp(err_hat, e0: float, tau: float, eps: float = 1e-6):
     err = np.asarray(err_hat, dtype=float)
     if err.ndim == 1:
         err = err[None, :]
+    err = np.where(np.isfinite(err), np.maximum(err, 0.0), err)  # Fehler semantisch >= 0
     tau = max(float(tau), eps)
     sqi = np.where(err <= e0, 1.0, np.exp(-(err - e0) / tau))
     sqi = np.where(np.isfinite(err), sqi, 0.0)
