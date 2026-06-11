@@ -41,6 +41,10 @@ import experts as X
 import gating as G
 import models as M
 import extract as E
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
 
 # Verzeichnis dieser Datei (src/) — robuste Pfadangabe für joblib/loky-Worker,
 # unabhängig vom Arbeitsverzeichnis des Notebooks.
@@ -76,12 +80,32 @@ def _prep_targets(rel_train: pd.DataFrame, target_metric: str = 'target'):
 # Hauptauswertung
 # ──────────────────────────────────────────────────────────────────────────
 
+def _make_stacker(kind: str = 'logreg', random_state: int = 42):
+    """Meta-Klassifikator für die gestapelte Fusion (Idee 3). Eingang = die drei
+    Experten-Wahrscheinlichkeiten [p_cecg, p_ppg, p_bcg], Ziel = AF.
+
+    'logreg' (Default): standardisierte logistische Regression — robust bei nur
+    3 Eingängen und 40 Patienten, kaum Überanpassungsrisiko, gut interpretierbar
+    (Koeffizienten = gelernte Experten-Gewichte). 'gb': Gradient Boosting, falls
+    nichtlineare Wechselwirkungen zwischen den Experten vermutet werden (mehr
+    Kapazität, höheres Überanpassungsrisiko bei wenig Patienten).
+    """
+    if kind == 'logreg':
+        return Pipeline([('sc', StandardScaler()),
+                         ('clf', LogisticRegression(max_iter=1000, class_weight='balanced',
+                                                    random_state=random_state))])
+    elif kind == 'gb':
+        return GradientBoostingClassifier(n_estimators=200, random_state=random_state)
+    raise ValueError("stack_clf muss 'logreg' oder 'gb' sein")
+
+
 def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
                  clf_per_modality: dict | None = None, gate_kind: str = 'mlp',
                  target_metric: str = 'target', inner_splits: int = 5,
                  min_spec: float = 0.80, random_state: int = 42,
                  gate_params: dict | None = None,
                  weight_map: str = 'softmax', map_params: dict | None = None,
+                 fusion: str = 'weighted', stack_clf: str = 'logreg',
                  freeze_weights: bool = False,
                  return_arrays: bool = False, return_weights: bool = False,
                  fold_cache: dict | None = None):
@@ -146,49 +170,63 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
     for tr, te, P_tr, P_te in fold_iter:
         y_tr = y[tr]
 
-        # 3/4) Gate fitten + Trainingsgewichte + Schwelle  (billig, varianten-abhängig)
-        w_const = None
-        if gate_kind == 'equal':
-            w_tr = G.equal_weights(len(tr))
-            gate, scale = None, None
+        if fusion == 'stacked':
+            # Idee 3: gelernter Meta-Klassifikator auf den OOF-Expertenwahrscheinlich-
+            # keiten [p_cecg, p_ppg, p_bcg] -> AF. Trainiert NUR auf Trainingspatienten
+            # (P_tr ist bereits out-of-fold), Vorhersage auf P_te. Kein Gate, keine
+            # Gewichte, kein GT — direkt aufs AF-Ziel optimiert (LOPO-sauber).
+            P_tr_a = np.asarray(P_tr, dtype=float)
+            P_te_a = np.asarray(P_te, dtype=float)
+            meta = _make_stacker(stack_clf, random_state)
+            meta.fit(P_tr_a, y_tr)
+            fused_tr = meta.predict_proba(P_tr_a)[:, 1]
+            t = M.choose_threshold(y_tr, fused_tr, min_spec)
+            fused_te = meta.predict_proba(P_te_a)[:, 1]
+            w_te = np.full((len(te), len(G.ORDER)), np.nan)   # Gewichte hier nicht definiert
         else:
-            T_tr = _prep_targets(rel_al.iloc[tr], target_metric)
-            gate = G.make_gate(kind=gate_kind, random_state=random_state,
-                               **(gate_params or {}))
-            gate.fit(df.iloc[tr][gate_cols].values, T_tr)
-            err_tr = gate.predict(df.iloc[tr][gate_cols].values)
-
-            # Fehler -> Gewicht: Abbildungs-Parameter NUR aus dem Training ableiten,
-            # dann IDENTISCH auf Train und Test anwenden (leckagefrei). 'softmax' =
-            # bisheriges Verhalten (Default, unverändert); 'exp' = Bachelet e0/τ (3.6.2).
-            if weight_map == 'softmax':
-                scale = float(np.nanmedian(err_tr)) + 1e-6   # feste Temperatur aus Training
-                _map = lambda e: G.errors_to_weights(e, scale=scale)
-            elif weight_map == 'exp':
-                mp = map_params or {}
-                e0 = float(mp.get('e0', np.nanpercentile(err_tr, 10)))
-                tau = float(mp.get('tau', np.nanmedian(err_tr) + 1e-6))
-                _map = lambda e: G.errors_to_weights_exp(e, e0=e0, tau=tau)
+            # 3/4) Gate fitten + Trainingsgewichte + Schwelle  (billig, varianten-abhängig)
+            w_const = None
+            if gate_kind == 'equal':
+                w_tr = G.equal_weights(len(tr))
+                gate, scale = None, None
             else:
-                raise ValueError("weight_map muss 'softmax' oder 'exp' sein")
+                T_tr = _prep_targets(rel_al.iloc[tr], target_metric)
+                gate = G.make_gate(kind=gate_kind, random_state=random_state,
+                                   **(gate_params or {}))
+                gate.fit(df.iloc[tr][gate_cols].values, T_tr)
+                err_tr = gate.predict(df.iloc[tr][gate_cols].values)
 
-            w_tr = _map(err_tr)
-            if freeze_weights:
-                # mittleres Trainingsgewicht je Modalität einfrieren (keine Pro-Fenster-Variation)
-                w_const = w_tr.mean(axis=0, keepdims=True)
-                w_tr = np.repeat(w_const, len(tr), axis=0)
+                # Fehler -> Gewicht: Abbildungs-Parameter NUR aus dem Training ableiten,
+                # dann IDENTISCH auf Train und Test anwenden (leckagefrei). 'softmax' =
+                # bisheriges Verhalten (Default, unverändert); 'exp' = Bachelet e0/τ (3.6.2).
+                if weight_map == 'softmax':
+                    scale = float(np.nanmedian(err_tr)) + 1e-6   # feste Temperatur aus Training
+                    _map = lambda e: G.errors_to_weights(e, scale=scale)
+                elif weight_map == 'exp':
+                    mp = map_params or {}
+                    e0 = float(mp.get('e0', np.nanpercentile(err_tr, 10)))
+                    tau = float(mp.get('tau', np.nanmedian(err_tr) + 1e-6))
+                    _map = lambda e: G.errors_to_weights_exp(e, e0=e0, tau=tau)
+                else:
+                    raise ValueError("weight_map muss 'softmax' oder 'exp' sein")
 
-        fused_tr = G.fuse(w_tr, P_tr)
-        t = M.choose_threshold(y_tr, fused_tr, min_spec)
+                w_tr = _map(err_tr)
+                if freeze_weights:
+                    # mittleres Trainingsgewicht je Modalität einfrieren (keine Pro-Fenster-Variation)
+                    w_const = w_tr.mean(axis=0, keepdims=True)
+                    w_tr = np.repeat(w_const, len(tr), axis=0)
 
-        # 5b) Testgewichte bestimmen (KEIN GT im Test!) und fusionieren
-        if gate_kind == 'equal':
-            w_te = G.equal_weights(len(te))
-        elif freeze_weights:
-            w_te = np.repeat(w_const, len(te), axis=0)   # eingefrorenes Trainingsmittel
-        else:
-            w_te = _map(gate.predict(df.iloc[te][gate_cols].values))
-        fused_te = G.fuse(w_te, P_te)
+            fused_tr = G.fuse(w_tr, P_tr)
+            t = M.choose_threshold(y_tr, fused_tr, min_spec)
+
+            # 5b) Testgewichte bestimmen (KEIN GT im Test!) und fusionieren
+            if gate_kind == 'equal':
+                w_te = G.equal_weights(len(te))
+            elif freeze_weights:
+                w_te = np.repeat(w_const, len(te), axis=0)   # eingefrorenes Trainingsmittel
+            else:
+                w_te = _map(gate.predict(df.iloc[te][gate_cols].values))
+            fused_te = G.fuse(w_te, P_te)
 
         yt.extend(y[te]); yp.extend(fused_te); yd.extend((fused_te >= t).astype(int))
         yg.extend(groups[te]); used_t.append(t); wt.extend(w_te)
@@ -677,3 +715,31 @@ def tune_torch_gate(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
     if verbose:
         print(f'Beste Val-SmoothL1: {study.best_value:.4f}  ·  beste Params: {best}')
     return best, study
+
+
+def compare_fusion(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
+                   clf_per_modality: dict | None = None,
+                   weighted_gates=('equal',), stack_clfs=('logreg', 'gb'),
+                   target_metric: str = 'target', inner_splits: int = 5,
+                   min_spec: float = 0.80, random_state: int = 42,
+                   fold_cache: dict | None = None, **kw) -> pd.DataFrame:
+    """Vergleicht gewichtete Fusion (Σ wₖ·pₖ) gegen die gestapelte Fusion (Idee 3)
+    auf DENSELBEN Experten/Folds (fold_cache wiederverwenden!). `weighted_gates`
+    = Gate-Varianten für die Σ-Fusion (z.B. ('equal','torch_mlp')); `stack_clfs`
+    = Meta-Klassifikatoren für die gestapelte Fusion. Gibt eine Zeile je Variante.
+    """
+    cols = ['AUC', 'Sensitivität', 'Spezifität', 'Accuracy']
+    rows = []
+    for gk in weighted_gates:
+        m, t = evaluate_moe(df, rel, y, groups, clf_per_modality=clf_per_modality,
+                            gate_kind=gk, fusion='weighted', target_metric=target_metric,
+                            inner_splits=inner_splits, min_spec=min_spec,
+                            random_state=random_state, fold_cache=fold_cache, **kw)
+        rows.append({'fusion': f'weighted:{gk}', **{c: m[c] for c in cols}, 'threshold': t})
+    for sc in stack_clfs:
+        m, t = evaluate_moe(df, rel, y, groups, clf_per_modality=clf_per_modality,
+                            fusion='stacked', stack_clf=sc, inner_splits=inner_splits,
+                            min_spec=min_spec, random_state=random_state,
+                            fold_cache=fold_cache, **kw)
+        rows.append({'fusion': f'stacked:{sc}', **{c: m[c] for c in cols}, 'threshold': t})
+    return pd.DataFrame(rows)
