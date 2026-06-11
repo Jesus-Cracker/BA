@@ -39,15 +39,134 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.neural_network import MLPRegressor
 from xgboost import XGBRegressor
-from sklearn.multioutput import MultiOutputRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import r2_score
+from sklearn.base import BaseEstimator, RegressorMixin
 
 ORDER = ['cecg', 'ppg', 'bcg']   # feste Modalitäts-Reihenfolge
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# PyTorch-MLP-Gate (Bachelet-Architektur 3.6.1), als sklearn-kompatibler
+# Multi-Output-Regressor. torch wird LAZY importiert, damit gating.py auch ohne
+# torch importierbar bleibt (gb/xgb/mlp/ridge funktionieren weiter).
+# ──────────────────────────────────────────────────────────────────────────
+
+class TorchMLPRegressor(BaseEstimator, RegressorMixin):
+    """
+    Vollverbundenes MLP (PyTorch): SQI-Vektor -> [err_cecg, err_ppg, err_bcg].
+
+    Bachelet-Stil (Fehlerprädiktion 3.6.1): ReLU in den versteckten Schichten,
+    LINEARE Ausgabe (Regression), SmoothL1Loss (robust ggü. Ausreißer-Fehlern),
+    Adam, L2 via `weight_decay`, Early-Stopping auf internem Validierungssplit.
+
+    WICHTIG (AF, nicht HF): Lernziel ist der AF-relevante Zuverlässigkeitsfehler
+    (z.B. dRR_SD-/CoSEn-Fehler aus reliability.py). Nur die ARCHITEKTUR stammt von
+    Bachelet (HF-Schätzung) — das Ziel bleibt AF.
+
+    Ein-/Ausgaben werden hier NICHT skaliert: das übernimmt die umgebende Pipeline
+    (StandardScaler) bzw. der TransformedTargetRegressor in `make_gate` — exakt wie
+    bei den übrigen Gates, also kein doppeltes Normalisieren und leckagefrei pro Fold.
+    """
+
+    def __init__(self, hidden_dims=(128, 64), lr: float = 1e-3,
+                 weight_decay: float = 1e-4, batch_size: int = 128,
+                 max_epochs: int = 300, patience: int = 20, dropout: float = 0.0,
+                 val_frac: float = 0.15, random_state: int = 42, device: str = 'cpu'):
+        self.hidden_dims = hidden_dims
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.batch_size = batch_size
+        self.max_epochs = max_epochs
+        self.patience = patience
+        self.dropout = dropout
+        self.val_frac = val_frac
+        self.random_state = random_state
+        self.device = device
+
+    def _build_net(self, n_in: int, n_out: int):
+        import torch.nn as nn
+        dims = list(self.hidden_dims) if self.hidden_dims else []
+        layers, d = [], n_in
+        for h in dims:
+            layers += [nn.Linear(d, int(h)), nn.ReLU()]
+            if self.dropout and float(self.dropout) > 0:
+                layers.append(nn.Dropout(float(self.dropout)))
+            d = int(h)
+        layers.append(nn.Linear(d, n_out))      # lineare Ausgabe (Regression)
+        return nn.Sequential(*layers)
+
+    def fit(self, X, y):
+        import torch
+        torch.manual_seed(int(self.random_state))
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+        if y.ndim == 1:
+            y = y[:, None]
+        self.n_features_in_ = int(X.shape[1])
+        self.n_outputs_ = int(y.shape[1])
+        dev = torch.device(self.device)
+
+        # interner Train/Val-Split fürs Early-Stopping (nur innerhalb der Trainingsdaten)
+        rng = np.random.default_rng(int(self.random_state))
+        n = len(X)
+        idx = rng.permutation(n)
+        n_val = int(round(float(self.val_frac) * n)) if self.val_frac else 0
+        n_val = min(max(n_val, 0), max(n - 1, 0))
+        va_idx, tr_idx = idx[:n_val], idx[n_val:]
+        use_es = n_val >= 1 and len(tr_idx) >= 1
+
+        Xtr = torch.from_numpy(X[tr_idx]).to(dev)
+        ytr = torch.from_numpy(y[tr_idx]).to(dev)
+        if use_es:
+            Xva = torch.from_numpy(X[va_idx]).to(dev)
+            yva = torch.from_numpy(y[va_idx]).to(dev)
+
+        self.net_ = self._build_net(self.n_features_in_, self.n_outputs_).to(dev)
+        opt = torch.optim.Adam(self.net_.parameters(), lr=float(self.lr),
+                               weight_decay=float(self.weight_decay))
+        loss_fn = torch.nn.SmoothL1Loss()
+
+        bs = max(int(self.batch_size), 1)
+        best_val, best_state, bad = np.inf, None, 0
+        gen = torch.Generator().manual_seed(int(self.random_state))
+        for _ in range(int(self.max_epochs)):
+            self.net_.train()
+            perm = torch.randperm(len(Xtr), generator=gen)
+            for s in range(0, len(Xtr), bs):
+                b = perm[s:s + bs]
+                opt.zero_grad()
+                loss = loss_fn(self.net_(Xtr[b]), ytr[b])
+                loss.backward()
+                opt.step()
+            if use_es:
+                self.net_.eval()
+                with torch.no_grad():
+                    vloss = float(loss_fn(self.net_(Xva), yva).item())
+                if vloss < best_val - 1e-6:
+                    best_val, bad = vloss, 0
+                    best_state = {k: v.detach().clone()
+                                  for k, v in self.net_.state_dict().items()}
+                else:
+                    bad += 1
+                    if bad >= int(self.patience):
+                        break
+        if use_es and best_state is not None:
+            self.net_.load_state_dict(best_state)
+        self.best_val_loss_ = float(best_val) if use_es else float('nan')
+        return self
+
+    def predict(self, X):
+        import torch
+        X = np.asarray(X, dtype=np.float32)
+        self.net_.eval()
+        with torch.no_grad():
+            out = self.net_(torch.from_numpy(X).to(torch.device(self.device))).cpu().numpy()
+        return out.ravel() if self.n_outputs_ == 1 else out
+
+
 def make_gate(kind: str = 'mlp', hidden=(64, 32), alpha: float = 1e-3,
-              random_state: int = 42):
+              random_state: int = 42, **gate_kw):
     """
     Multi-Output-Regressor: SQI-Vektor -> [err_cecg, err_ppg, err_bcg].
     Ein- und Ausgaben werden normalisiert (Ziel via TransformedTargetRegressor).
@@ -67,8 +186,27 @@ def make_gate(kind: str = 'mlp', hidden=(64, 32), alpha: float = 1e-3,
             n_estimators=300, max_depth=3, learning_rate=0.05,
             subsample=0.8, colsample_bytree=0.8, random_state=random_state,
             n_jobs=1, tree_method='hist'))
+    elif kind == 'torch_mlp':
+        # PyTorch-MLP-Gate (Bachelet-Architektur 3.6.1). Hyperparameter kommen aus
+        # gate_kw (Optuna-Resultat); Defaults = Bachelets finale Wahl (128,64).
+        # Lernziel bleibt der AF-relevante Zuverlässigkeitsfehler, NICHT HF.
+        return TransformedTargetRegressor(
+            regressor=Pipeline([
+                ('imp', SimpleImputer(strategy='median')),
+                ('sc',  StandardScaler()),
+                ('reg', TorchMLPRegressor(
+                    hidden_dims=gate_kw.get('hidden_dims', (128, 64)),
+                    lr=gate_kw.get('lr', 1e-3),
+                    weight_decay=gate_kw.get('weight_decay', 1e-4),
+                    batch_size=gate_kw.get('batch_size', 128),
+                    max_epochs=gate_kw.get('max_epochs', 300),
+                    patience=gate_kw.get('patience', 20),
+                    dropout=gate_kw.get('dropout', 0.0),
+                    val_frac=gate_kw.get('val_frac', 0.15),
+                    random_state=random_state))]),
+            transformer=StandardScaler())
     else:
-        raise ValueError("kind muss 'mlp', 'gb', 'ridge' oder 'xgb' sein")
+        raise ValueError("kind muss 'mlp', 'gb', 'ridge', 'xgb' oder 'torch_mlp' sein")
 
     inner = Pipeline([('imp', SimpleImputer(strategy='median')),
                       ('sc',  StandardScaler()),
@@ -95,6 +233,32 @@ def errors_to_weights(err_hat, scale: float | None = None, eps: float = 1e-6):
     w = np.exp(np.nan_to_num(z, nan=-np.inf))
     w = w / (w.sum(axis=1, keepdims=True) + eps)
     return w
+
+
+def errors_to_weights_exp(err_hat, e0: float, tau: float, eps: float = 1e-6):
+    """
+    Bachelet-Abbildung (3.6.2) Fehler -> Gewicht, zeilenweise normiert (Σ=1):
+
+        SQI = 1                        für err <= e0   (Toleranz für kleine Fehler)
+        SQI = exp(-(err - e0) / tau)   für err >  e0   (Abklingen mit Konstante τ)
+
+    Anschließend werden die SQIs je Fenster auf Σ=1 normiert -> Fusionsgewichte.
+    Ungültige (NaN) Fehler -> SQI 0 (maximal unzuverlässig). Ist die ganze Zeile
+    ungültig, wird auf Gleichgewicht zurückgefallen (statt Division durch 0).
+
+    e0, τ werden wie bei Bachelet per Optuna bestimmt (hier explizit übergeben).
+    Kleines τ = härtere, fast Argmin-artige Gewichtung; großes τ = weicher.
+    Monoton fallend wie `errors_to_weights`, nur mit Toleranzschwelle e0 und
+    exponentiellem statt softmax-Abfall.
+    """
+    err = np.asarray(err_hat, dtype=float)
+    if err.ndim == 1:
+        err = err[None, :]
+    tau = max(float(tau), eps)
+    sqi = np.where(err <= e0, 1.0, np.exp(-(err - e0) / tau))
+    sqi = np.where(np.isfinite(err), sqi, 0.0)
+    s = sqi.sum(axis=1, keepdims=True)
+    return np.where(s > eps, sqi / (s + eps), 1.0 / err.shape[1])
 
 
 def equal_weights(n_rows: int, n_mod: int = 3):
@@ -151,4 +315,25 @@ if __name__ == '__main__':
     probs = rng.uniform(0, 1, size=(len(w), 3))
     fused = fuse(w, probs)
     print('fused shape       :', fused.shape, '· in [0,1]:', bool((fused >= 0).all() and (fused <= 1).all()))
+
+    # Bachelet-Abbildung (e0/τ): kleiner Fehler -> Gewicht ~1, großer -> ~0, Σ=1
+    we = errors_to_weights_exp(err_hat, e0=0.05, tau=0.5)
+    print('exp-Gewichtssummen ~1 :', np.allclose(we.sum(axis=1), 1.0))
+    print('exp-mittlere Gewichte :', {m: round(we[:, i].mean(), 3) for i, m in enumerate(ORDER)})
+    assert we[:, 1].mean() > we[:, 2].mean(), 'exp: PPG (kleiner Fehler) muss > BCG gewichtet sein'
+
+    # torch_mlp-Gate nur testen, wenn PyTorch installiert ist (sonst überspringen)
+    try:
+        import torch  # noqa: F401
+        gate_t = make_gate(kind='torch_mlp', max_epochs=60, patience=15, random_state=0)
+        gate_t.fit(SQI[:split], err_true[:split])
+        err_hat_t = gate_t.predict(SQI[split:])
+        print('torch_mlp R² je Modalität:',
+              {m: round(r2_score(err_true[split:, i], err_hat_t[:, i]), 3) for i, m in enumerate(ORDER)})
+        wt = errors_to_weights(err_hat_t)
+        assert np.allclose(wt.sum(axis=1), 1.0)
+        print('torch_mlp-Gate OK.')
+    except ImportError:
+        print('torch nicht installiert -> torch_mlp-Test übersprungen (erwartet in diesem Sandbox).')
+
     print('Selbsttest OK.')

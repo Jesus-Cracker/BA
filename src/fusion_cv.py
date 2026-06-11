@@ -80,6 +80,8 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
                  clf_per_modality: dict | None = None, gate_kind: str = 'mlp',
                  target_metric: str = 'target', inner_splits: int = 5,
                  min_spec: float = 0.80, random_state: int = 42,
+                 gate_params: dict | None = None,
+                 weight_map: str = 'softmax', map_params: dict | None = None,
                  freeze_weights: bool = False,
                  return_arrays: bool = False, return_weights: bool = False,
                  fold_cache: dict | None = None):
@@ -151,11 +153,26 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
             gate, scale = None, None
         else:
             T_tr = _prep_targets(rel_al.iloc[tr], target_metric)
-            gate = G.make_gate(kind=gate_kind, random_state=random_state)
+            gate = G.make_gate(kind=gate_kind, random_state=random_state,
+                               **(gate_params or {}))
             gate.fit(df.iloc[tr][gate_cols].values, T_tr)
             err_tr = gate.predict(df.iloc[tr][gate_cols].values)
-            scale = float(np.nanmedian(err_tr)) + 1e-6   # feste Temperatur aus Training
-            w_tr = G.errors_to_weights(err_tr, scale=scale)
+
+            # Fehler -> Gewicht: Abbildungs-Parameter NUR aus dem Training ableiten,
+            # dann IDENTISCH auf Train und Test anwenden (leckagefrei). 'softmax' =
+            # bisheriges Verhalten (Default, unverändert); 'exp' = Bachelet e0/τ (3.6.2).
+            if weight_map == 'softmax':
+                scale = float(np.nanmedian(err_tr)) + 1e-6   # feste Temperatur aus Training
+                _map = lambda e: G.errors_to_weights(e, scale=scale)
+            elif weight_map == 'exp':
+                mp = map_params or {}
+                e0 = float(mp.get('e0', np.nanpercentile(err_tr, 10)))
+                tau = float(mp.get('tau', np.nanmedian(err_tr) + 1e-6))
+                _map = lambda e: G.errors_to_weights_exp(e, e0=e0, tau=tau)
+            else:
+                raise ValueError("weight_map muss 'softmax' oder 'exp' sein")
+
+            w_tr = _map(err_tr)
             if freeze_weights:
                 # mittleres Trainingsgewicht je Modalität einfrieren (keine Pro-Fenster-Variation)
                 w_const = w_tr.mean(axis=0, keepdims=True)
@@ -170,7 +187,7 @@ def evaluate_moe(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
         elif freeze_weights:
             w_te = np.repeat(w_const, len(te), axis=0)   # eingefrorenes Trainingsmittel
         else:
-            w_te = G.errors_to_weights(gate.predict(df.iloc[te][gate_cols].values), scale=scale)
+            w_te = _map(gate.predict(df.iloc[te][gate_cols].values))
         fused_te = G.fuse(w_te, P_te)
 
         yt.extend(y[te]); yp.extend(fused_te); yd.extend((fused_te >= t).astype(int))
@@ -559,3 +576,104 @@ def gate_predictive_validity(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
         rows.append({'modality': m, 'r': r, 'rho': rho,
                      'R2_vs_train_mean': r2, 'n_valid': n})
     return pd.DataFrame(rows).set_index('modality')
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Optuna-Hyperparametersuche fürs torch_mlp-Gate (Bachelet 3.7.3 -> AF übersetzt)
+# ──────────────────────────────────────────────────────────────────────────
+
+def _smooth_l1(p, t, beta: float = 1.0) -> float:
+    """SmoothL1/Huber (beta=1) als reine numpy-Funktion (kein torch nötig fürs
+    Studien-Objective). Identisch zu torch.nn.SmoothL1Loss(reduction='mean')."""
+    d = np.abs(np.asarray(p, float) - np.asarray(t, float))
+    return float(np.mean(np.where(d < beta, 0.5 * d * d / beta, d - 0.5 * beta)))
+
+
+def tune_torch_gate(df: pd.DataFrame, rel: pd.DataFrame, y, groups,
+                    target_metric: str = 'target', n_trials: int = 100,
+                    cv_splits: int = 5, random_state: int = 42,
+                    gate_kind: str = 'torch_mlp', n_jobs: int = 1,
+                    timeout: float | None = None, verbose: bool = True):
+    """
+    Optuna-Suche für die Gate-Hyperparameter — Bachelet 3.7.3, auf AF übersetzt.
+
+    Zielgröße der Studie (direction='minimize') = mittlerer VALIDIERUNGS-SmoothL1
+    der Fehlerprädiktion in PATIENTENGRUPPIERTER CV (GroupKFold über Patienten;
+    cv_splits Folds — Bachelet nutzt volle LOPO, hier aus Laufzeitgründen K-Fold,
+    aber weiterhin gruppiert => kein Patient gleichzeitig in Train/Val).
+    Bewertet wird NUR auf GT-gültigen Fenstern (rel_<mod>_valid), sonst verzerrt der
+    Sentinel den Verlust.
+
+    WICHTIG (AF, nicht HF): `target_metric` ist das AF-relevante Zuverlässigkeitsziel
+    (Default 'target' = die in reliability.py gewählte AF-Metrik, z.B. cosen_err/
+    drr_sd_err). NICHT 'hr_err' verwenden — das wäre Bachelets HF-Ziel und nicht das
+    Ziel dieser Arbeit. Das Gate wird auf die AF-relevante Zuverlässigkeit trainiert;
+    die eigentliche AF-Bewertung erfolgt anschließend separat über `compare_gates`
+    (fensterweise AF-Metriken, LOPO).
+
+    Suchraum (wie Bachelet Tab. 3.11): hidden_dims {64,128,(128,64),(256,128)},
+    lr [1e-4,8e-3] log, weight_decay [2e-5,2e-3] log, batch_size {32,64,128,256},
+    max_epochs [20,600], patience [8,60], dropout [0,0.3].
+
+    Hinweis Parallelität: bei n_jobs>1 ggf. torch.set_num_threads(1) setzen, damit
+    Optuna-Trials und torch-Intraop-Threads sich nicht überzeichnen.
+
+    Rückgabe: (best_params: dict, study). best_params lässt sich direkt als
+    `gate_params=...` an evaluate_moe / compare_gates übergeben.
+    """
+    import optuna
+    from sklearn.model_selection import GroupKFold
+
+    if target_metric == 'hr_err':
+        raise ValueError("target_metric='hr_err' ist Bachelets HF-Ziel — diese Arbeit "
+                         "detektiert AF. Nutze 'target' (= AF-Metrik) bzw. 'cosen_err'/"
+                         "'drr_sd_err'.")
+
+    y = np.asarray(y); groups = np.asarray(groups)
+    rel_al = align_reliability(df, rel)
+    gate_cols = E.gate_sqi_cols(df, 'all')
+    Xall = df[gate_cols].values
+
+    n_splits = min(cv_splits, len(np.unique(groups)))
+    folds = list(GroupKFold(n_splits=n_splits).split(df, y, groups))
+
+    def objective(trial):
+        hd = trial.suggest_categorical('hidden_dims', ['64', '128', '128,64', '256,128'])
+        hp = dict(
+            hidden_dims=tuple(int(x) for x in hd.split(',')),
+            lr=trial.suggest_float('lr', 1e-4, 8e-3, log=True),
+            weight_decay=trial.suggest_float('weight_decay', 2e-5, 2e-3, log=True),
+            batch_size=trial.suggest_categorical('batch_size', [32, 64, 128, 256]),
+            max_epochs=trial.suggest_int('max_epochs', 20, 600),
+            patience=trial.suggest_int('patience', 8, 60),
+            dropout=trial.suggest_float('dropout', 0.0, 0.3),
+        )
+        losses = []
+        for tr, va in folds:
+            T_tr = _prep_targets(rel_al.iloc[tr], target_metric)
+            gate = G.make_gate(kind=gate_kind, random_state=random_state, **hp)
+            gate.fit(Xall[tr], T_tr)
+            pred = np.asarray(gate.predict(Xall[va]), dtype=float)
+            rel_va = rel_al.iloc[va].reset_index(drop=True)
+            p_all, t_all = [], []
+            for j, m in enumerate(G.ORDER):
+                valid = (rel_va[f'rel_{m}_valid'] == True).to_numpy()
+                true_e = rel_va[f'rel_{m}_{target_metric}'].values.astype(float)
+                ok = valid & np.isfinite(true_e)
+                if ok.sum() == 0:
+                    continue
+                p_all.append(pred[ok, j]); t_all.append(true_e[ok])
+            if p_all:
+                losses.append(_smooth_l1(np.concatenate(p_all), np.concatenate(t_all)))
+        return float(np.mean(losses)) if losses else float('inf')
+
+    optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.WARNING)
+    study = optuna.create_study(direction='minimize',
+                                sampler=optuna.samplers.TPESampler(seed=random_state))
+    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, timeout=timeout)
+
+    best = dict(study.best_params)
+    best['hidden_dims'] = tuple(int(x) for x in best['hidden_dims'].split(','))
+    if verbose:
+        print(f'Beste Val-SmoothL1: {study.best_value:.4f}  ·  beste Params: {best}')
+    return best, study
