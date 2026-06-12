@@ -1,6 +1,5 @@
 import numpy as np
 import csv
-import json
 from scipy.signal import butter, filtfilt
 import matplotlib.pyplot as plt
 import matplotlib.pyplot as plt
@@ -123,33 +122,8 @@ class PatientSignals:
             self.bcg1_filt = correct_signal(self.bcg1_filt, initial_offset, final_offset)
         if self.bcg2_filt is not None:
             self.bcg2_filt = correct_signal(self.bcg2_filt, initial_offset, final_offset)
-
-    def apply_polarity(self):
-        """Adapt signal orientation from polarity.json if it exists.
-
-        Patients that have a polarity.json in their folder get their filtered
-        signals reoriented according to the saved signs. Patients without the
-        file are left untouched (their default orientation is taken as correct).
-        Call this after filter_all() (and offset_correction(), if used).
-        """
-        polarity_file = os.path.join(self.folder, "polarity.json")
-        if not os.path.exists(polarity_file):
-            return  # no file -> keep default orientation
-
-        try:
-            with open(polarity_file, "r") as f:
-                polarity = json.load(f)
-        except Exception as e:
-            print(f"Error reading polarity file: {e}")
-            return
-
-        for name, sign in polarity.items():
-            attr = f"{name}_filt"
-            sig = getattr(self, attr, None)
-            if sig is not None:
-                setattr(self, attr, np.asarray(sig) * int(sign))
-
-
+  
+    
     def plot_all_filtered(self):
         if self.data is None or self.gt_ecg_filt is None:
             print("No filtered data to plot.")
@@ -165,7 +139,7 @@ class PatientSignals:
         axs[3].plot(t_128, self.ppg2_filt, label='Filtered PPG2')
         axs[4].plot(t_128, self.bcg1_filt, label='Filtered BCG1')
         axs[5].plot(t_128, self.bcg2_filt, label='Filtered BCG2')
-
+    
         for ax in axs:
             ax.legend()
             ax.grid(True)

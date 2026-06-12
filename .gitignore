@@ -1,5 +1,7 @@
 data/
 results/
+oldCode/
+BA_Text/
 .venv/
 **/__pycache__/
 
