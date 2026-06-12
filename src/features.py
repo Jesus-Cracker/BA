@@ -672,6 +672,222 @@ def af_rr_cecg_cwt(signal, fs, prefix=''):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# 4c. BCG-Wavelet-Features (Yu et al. 2019, IEEE EMBC 4322) — SWT + PAPR
+# ──────────────────────────────────────────────────────────────────────────
+#
+# WARUM KEINE RR/HRV-FEATURES FÜR BCG?
+#   Der BCG-J-Peak-Detektor ist die eigentliche Schwachstelle der Pipeline.
+#   Schlägt er fehl (häufig bei BCG: I/J/K-Mehrgipfel, Atemmodulation,
+#   Positionswechsel), sind ALLE RR-/HRV-/AF-RR-Merkmale Müll oder NaN — genau
+#   das erklärt, warum BCG im bisherigen Stand "fast Rauschen" war.
+#   Yu et al. (2019) zeigen: AF ist im BCG NICHT primär über die RR-Streuung,
+#   sondern über die MORPHOLOGISCHE Unruhe zwischen den Schlägen erkennbar
+#   (chaotische Vorhof-Mechanik -> hochfrequentes Clutter zwischen den J-Zacken).
+#   Sie quantifizieren das DETEKTIONSFREI über die Stationäre Wavelet-Transform
+#   (SWT, zeitinvariant) und das Peak-to-Average Power Ratio (PAPR) je Koeffizient
+#   und erreichen damit acc/sens/spec = 94.4/97.0/89.1 % — ganz ohne Peakdetektion.
+#
+#   Paper-Merkmalssatz (26 je 30-s-Epoche):
+#     * 12x PAPR : PAPR der SWT-Detailkoeffizienten  (PAPR_d, Level 1..6)
+#                  und der SWT-Approximations-/Grobkoeffizienten (PAPR_c, 1..6)
+#     * 10x Statistik: mean, median, std, MAD (mittlere Absolutabw.),
+#                      p25, p75, IQR, Shannon-Entropie, Skewness, Kurtosis
+#     *  4x Frequenz : spektrale Entropie, dominante Frequenz, Magnitude der
+#                      dominanten Frequenz, Verhältnis (rel. Leistung) derselben
+#
+#   Vorverarbeitung je Epoche: Min-Max-Normierung (Paper: "normalized with its
+#   maximum and minimum value") -> amplituden-/positionsinvariant (BCG-Amplitude
+#   hängt stark von Schlafposition/Sensorkontakt ab).
+#
+#   NCA-Auswahl des Papers (10): Kurtosis, PAPR_d 1..5, PAPR_c 1..4.
+#   -> Wir extrahieren den VOLLEN 26er-Satz; die Selektion (NCA o.Ä.) gehört ins
+#      Trainings-Notebook, nicht hart in die Extraktion (sonst nicht reproduzierbar
+#      und nicht über LOPO-CV validierbar). bcg_paper_nca10_keys() liefert die
+#      Paper-Teilmenge für direkte Reproduktion.
+
+BCG_SWT_WAVELET = 'db4'        # gängige Wahl für biomed. SWT (Hyperparameter)
+BCG_SWT_LEVEL   = 6            # 6 Detail- + 6 Grobkoeffizienten (Paper)
+BCG_PAPR_DOMAIN = 'spectrum'   # 'spectrum': PAPR des Leistungsspektrums je Koeff.
+                               #   (paper-treu: "power spectrum of the wavelet
+                               #    coefficient ... peak-to-average power ratio")
+                               # 'time': PAPR direkt auf |c|^2 im Zeitbereich.
+
+BCG_STAT_KEYS = ['mean', 'median', 'std', 'mad', 'p25', 'p75', 'iqr',
+                 'shannon', 'skew', 'kurtosis']
+BCG_FREQ_KEYS = ['spec_entropy', 'dom_freq', 'dom_mag', 'dom_ratio']
+
+
+def _bcg_papr_keys(level=BCG_SWT_LEVEL):
+    return ([f'PAPR_d{l}' for l in range(1, level + 1)]
+            + [f'PAPR_c{l}' for l in range(1, level + 1)])
+
+
+def bcg_feature_keys(prefix, level=BCG_SWT_LEVEL):
+    """Vollständige, IMMER vorhandene Schlüsselliste (stabile Spaltenstruktur)."""
+    return [f'{prefix}_{k}'
+            for k in (_bcg_papr_keys(level) + BCG_STAT_KEYS + BCG_FREQ_KEYS)]
+
+
+def bcg_paper_nca10_keys(prefix):
+    """Die 10 vom Paper per NCA gewählten Merkmale (für exakte Reproduktion)."""
+    sub = (['kurtosis']
+           + [f'PAPR_d{l}' for l in range(1, 6)]    # d1..d5
+           + [f'PAPR_c{l}' for l in range(1, 5)])   # c1..c4
+    return [f'{prefix}_{k}' for k in sub]
+
+
+def _papr(coeff, domain=BCG_PAPR_DOMAIN):
+    """
+    Peak-to-Average Power Ratio eines (Wavelet-)Koeffizientenvektors.
+
+    Der Mittelwert wird zuvor entfernt (Detrending): nach der Min-Max-Normierung
+    trägt die Epoche einen DC-Offset, der sonst (besonders in den Grob-/cA-
+    Koeffizienten) die DC-Bin im Leistungsspektrum dominieren und das PAPR
+    uninformativ machen würde. Wir messen also die Verteilung der AC-Leistung.
+
+    domain='spectrum': PAPR des Leistungsspektrums |FFT(c)|^2  (paper-treu).
+    domain='time'    : PAPR der Momentanleistung c^2 im Zeitbereich.
+    """
+    x = np.asarray(coeff, dtype=float)
+    if x.size == 0 or not np.all(np.isfinite(x)):
+        return np.nan
+    x = x - np.mean(x)
+    if np.allclose(x, 0.0):
+        return np.nan
+    p = np.abs(np.fft.rfft(x)) ** 2 if domain == 'spectrum' else x ** 2
+    m = float(np.mean(p))
+    return _finite(float(np.max(p)) / m) if m > 0 else np.nan
+
+
+def _minmax_norm(signal):
+    """Min-Max-Normierung auf [0,1] (Paper: positionsinvariante BCG-Amplitude).
+    None bei flachem/ungültigem Fenster."""
+    x = np.asarray(signal, dtype=float)
+    if x.size == 0 or not np.all(np.isfinite(x)):
+        return None
+    lo, hi = float(np.min(x)), float(np.max(x))
+    if hi - lo < 1e-12:
+        return None
+    return (x - lo) / (hi - lo)
+
+
+def _swt_papr(signal, wavelet=BCG_SWT_WAVELET, level=BCG_SWT_LEVEL,
+              domain=BCG_PAPR_DOMAIN):
+    """
+    12 PAPR-Werte: PAPR_d(1..L) und PAPR_c(1..L) der SWT-Koeffizienten.
+
+    Längen-robust: pywt.swt verlangt eine durch 2**level teilbare (gerade) Länge.
+    30 s @128 Hz = 3840 = 2^8·15 ist bereits durch 2^6 teilbar; für beliebige
+    Fenster wird symmetrisch ans Ende gepolstert und danach wieder zugeschnitten.
+    """
+    import pywt
+    x = np.asarray(signal, dtype=float)
+    keys = _bcg_papr_keys(level)
+    nan_out = {k: np.nan for k in keys}
+    n = len(x)
+    if n < (1 << level) or not np.all(np.isfinite(x)) or np.std(x) == 0:
+        return nan_out
+    mult = 1 << level
+    pad = (-n) % mult                       # Samples bis zum nächsten Vielfachen
+    if pad:
+        x = np.pad(x, (0, pad), mode='symmetric')
+    try:
+        coeffs = pywt.swt(x, wavelet, level=level)   # [(cA_L,cD_L)...(cA_1,cD_1)]
+    except Exception:
+        return nan_out
+    out = {}
+    L = len(coeffs)
+    for idx, (cA, cD) in enumerate(coeffs):
+        lvl = L - idx                        # idx 0 = höchstes (gröbstes) Level
+        if pad:
+            cA, cD = cA[:n], cD[:n]          # Padding wieder entfernen
+        out[f'PAPR_d{lvl}'] = _papr(cD, domain)
+        out[f'PAPR_c{lvl}'] = _papr(cA, domain)
+    return {k: out.get(k, np.nan) for k in keys}
+
+
+def _bcg_summary_stats(signal, prefix):
+    """10 Summenstatistiken des (normierten) Fensters gemäß Paper."""
+    x = np.asarray(signal, dtype=float)
+    p = f'{prefix}_'
+    keys = [f'{p}{k}' for k in BCG_STAT_KEYS]
+    if x.size < 2 or not np.all(np.isfinite(x)):
+        return {k: np.nan for k in keys}
+    q25, q75 = np.percentile(x, [25, 75])
+    hist, _ = np.histogram(x, bins=32)       # Shannon-Entropie der Amplituden
+    s = hist.sum()
+    if s > 0:
+        pr = hist[hist > 0] / s
+        shannon = float(-np.sum(pr * np.log(pr)) / np.log(len(pr))) if len(pr) > 1 else np.nan
+    else:
+        shannon = np.nan
+    return {
+        f'{p}mean':     float(np.mean(x)),
+        f'{p}median':   float(np.median(x)),
+        f'{p}std':      float(np.std(x)),
+        f'{p}mad':      float(np.mean(np.abs(x - np.mean(x)))),
+        f'{p}p25':      float(q25),
+        f'{p}p75':      float(q75),
+        f'{p}iqr':      float(q75 - q25),
+        f'{p}shannon':  shannon,
+        f'{p}skew':     _finite(float(skew(x))),
+        f'{p}kurtosis': _finite(float(scipy_kurtosis(x))),
+    }
+
+
+def _bcg_freq_feats(signal, fs, prefix):
+    """4 Frequenz-Merkmale; DC wird vor der FFT entfernt (Detrending)."""
+    x = np.asarray(signal, dtype=float)
+    p = f'{prefix}_'
+    keys = [f'{p}{k}' for k in BCG_FREQ_KEYS]
+    if x.size < 4 or not np.all(np.isfinite(x)) or np.std(x) == 0:
+        return {k: np.nan for k in keys}
+    x = x - np.mean(x)
+    freqs = np.fft.rfftfreq(len(x), d=1.0 / fs)
+    psd   = np.abs(np.fft.rfft(x)) ** 2 / len(x)
+    tot   = float(psd.sum())
+    band  = (freqs >= 0.7) & (freqs <= 10.0)     # physiolog. BCG-Band (paperkonform)
+    if band.any() and psd[band].sum() > 0:
+        i = int(np.argmax(psd[band]))
+        dom_f = float(freqs[band][i]); dom_m = float(psd[band][i])
+    else:
+        dom_f = dom_m = np.nan
+    pr = psd[psd > 0] / tot if tot > 0 else np.array([])
+    spec_ent = float(-np.sum(pr * np.log(pr)) / np.log(len(pr))) if len(pr) > 1 else np.nan
+    return {
+        f'{p}spec_entropy': spec_ent,
+        f'{p}dom_freq':     dom_f,
+        f'{p}dom_mag':      dom_m,
+        f'{p}dom_ratio':    _finite(dom_m / tot) if (tot > 0 and np.isfinite(dom_m)) else np.nan,
+    }
+
+
+def bcg_wavelet_feature_block(signal, fs, prefix, wavelet=BCG_SWT_WAVELET,
+                              level=BCG_SWT_LEVEL, papr_domain=BCG_PAPR_DOMAIN,
+                              normalize=True):
+    """
+    Paper-treuer BCG-Merkmalsblock (Yu et al. 2019): 26 Merkmale, KEINE RR/HRV.
+
+    Schlüssel sind IMMER vorhanden (NaN bei Fehlschlag) -> einheitliche
+    Spaltenstruktur über alle Fenster (analog zu signal_feature_block).
+    Signatur ist mit den HRV/af_rr-Wrappern kompatibel (signal, fs, prefix),
+    sodass die Funktion direkt in extract.py eingehängt werden kann.
+    """
+    x = np.asarray(signal, dtype=float)
+    if normalize:
+        xn = _minmax_norm(x)
+        if xn is None:                       # flaches/ungültiges Fenster
+            return {k: np.nan for k in bcg_feature_keys(prefix, level)}
+        x = xn
+    block = {}
+    papr = _swt_papr(x, wavelet=wavelet, level=level, domain=papr_domain)
+    block.update({f'{prefix}_{k}': v for k, v in papr.items()})
+    block.update(_bcg_summary_stats(x, prefix))
+    block.update(_bcg_freq_feats(x, fs, prefix))
+    return block
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # 5. Bündelung pro Signal
 # ──────────────────────────────────────────────────────────────────────────
 

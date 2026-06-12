@@ -82,7 +82,7 @@ SQI_KEYS = ['kSQI', 'sSQI', 'pSQI', 'bSQI', 'tSQI', 'composite']
 # Feature-Version: geht in den Cache-Hash ein. Bei JEDER Änderung an der
 # Spaltenstruktur (neue Features) erhöhen -> alte Caches werden NICHT mehr
 # stillschweigend wiederverwendet (verhindert "fehlende Spalten"-Fehler).
-FEAT_VERSION = 'v3_acf_xmodal_xcorr'
+FEAT_VERSION = 'v4_bcg_swt_papr'
 
 # Standard-Detektoren je Signal (entsprechen dem bisher besten Stand).
 # Es werden NAMEN (Strings) gespeichert, damit joblib/loky-Worker sie sicher
@@ -122,6 +122,15 @@ class ExtractConfig:
     use_af_rr: bool = True               # AF-spezifische RR-Merkmale anhängen
     use_legacy_freq: bool = False        # alte LF/HF-Frequenzbänder (nur Reproduktion)
 
+    # BCG-Merkmalspfad:
+    #   'wavelet' (Standard): SWT+PAPR-Merkmale nach Yu et al. 2019 (KEINE RR/HRV).
+    #                         Begründung s. features.bcg_wavelet_feature_block:
+    #                         AF zeigt sich im BCG morphologisch (Clutter), nicht
+    #                         über die unzuverlässige J-Peak-RR-Streuung.
+    #   'rr'      (Altpfad) : bisherige HRV/af_rr-Merkmale aus J-Peak-Detektion
+    #                         (für A/B-Vergleich in der Arbeit beibehalten).
+    bcg_mode:  str = 'wavelet'
+
     # Fenster behalten, wenn >= min_valid_hrv Signale eine HRV liefern.
     # 0 = wirklich alle Fenster behalten (empfohlen für MoE: ein totes cECG-Fenster
     #     kann über ein gutes PPG-Fenster trotzdem korrekt klassifiziert werden).
@@ -141,7 +150,7 @@ class ExtractConfig:
         cfg = '|'.join(
             [self.hrv_fn[s] for s in SIGNALS]
             + [self.af_rr_fn[s] for s in SIGNALS]
-            + [str(self.use_af_rr), str(self.use_legacy_freq),
+            + [str(self.use_af_rr), str(self.use_legacy_freq), str(self.bcg_mode),
                str(self.window_s), str(self.hop_s), str(self.min_valid_hrv),
                FEAT_VERSION]
         )
@@ -155,6 +164,7 @@ class ExtractConfig:
             data_root=self.data_root, fs=self.fs, win=self.win, hop=self.hop,
             hrv_fn=self.hrv_fn, af_rr_fn=self.af_rr_fn,
             use_af_rr=self.use_af_rr, use_legacy_freq=self.use_legacy_freq,
+            bcg_mode=self.bcg_mode,
             min_valid_hrv=self.min_valid_hrv,
         )
 
@@ -165,13 +175,16 @@ class ExtractConfig:
 
 def extract_window(sig_windows: dict, fs: int,
                    hrv_fn: dict, af_rr_fn: dict,
-                   use_af_rr: bool = True, use_legacy_freq: bool = False):
+                   use_af_rr: bool = True, use_legacy_freq: bool = False,
+                   bcg_mode: str = 'wavelet'):
     """
     Berechnet Merkmals-Block + SQIs für EIN Fenster.
 
     sig_windows : {signalname: 1D-np.ndarray}   (gefiltertes Fenster je Signal)
     hrv_fn      : {signalname: callable(signal, fs, prefix)->dict|None}
     af_rr_fn    : {signalname: callable(...)->dict|None}
+    bcg_mode    : 'wavelet' -> BCG nutzt SWT+PAPR-Merkmale (Yu et al. 2019, KEINE
+                  RR/HRV); 'rr' -> bisheriger HRV/af_rr-Pfad (A/B-Vergleich).
 
     Rückgabe: (feat: dict, n_valid_hrv: int)
         feat enthält die Experten-Merkmale ({signal}_*) UND die Gate-SQIs
@@ -184,12 +197,16 @@ def extract_window(sig_windows: dict, fs: int,
         w = sig_windows[s]
 
         # --- Experten-Merkmale (identische Spaltenstruktur über alle Fenster) ---
-        block = F.signal_feature_block(
-            w, fs, s,
-            hrv_fn=hrv_fn[s],
-            af_rr_fn=af_rr_fn[s] if use_af_rr else None,
-            use_legacy_freq=use_legacy_freq,
-        )
+        if s in ('bcg1', 'bcg2') and bcg_mode == 'wavelet':
+            # Paper-treuer BCG-Pfad: SWT+PAPR-Morphologie statt RR/HRV.
+            block = F.bcg_wavelet_feature_block(w, fs, s)
+        else:
+            block = F.signal_feature_block(
+                w, fs, s,
+                hrv_fn=hrv_fn[s],
+                af_rr_fn=af_rr_fn[s] if use_af_rr else None,
+                use_legacy_freq=use_legacy_freq,
+            )
         feat.update(block)
 
         # --- SQIs (Gate-Eingang) ---
@@ -271,7 +288,8 @@ def _extract_one_patient(pid: str, cfgd: dict, af_set: set):
         sig_windows = {s: getattr(pat, f'{s}_filt')[start:start + win] for s in SIGNALS}
         feat, n_valid = extract_window(
             sig_windows, fs, hrv, afrr,
-            use_af_rr=cfgd['use_af_rr'], use_legacy_freq=cfgd['use_legacy_freq'])
+            use_af_rr=cfgd['use_af_rr'], use_legacy_freq=cfgd['use_legacy_freq'],
+            bcg_mode=cfgd.get('bcg_mode', 'wavelet'))
 
         if n_valid < cfgd['min_valid_hrv']:
             continue
@@ -308,6 +326,8 @@ def extract_dataset(cfg: ExtractConfig, n_jobs: int = 8, verbose: bool = True) -
             raise RuntimeError(f"HRV-Funktion '{cfg.hrv_fn[s]}' fehlt in features.py")
         if cfg.use_af_rr and not hasattr(F, cfg.af_rr_fn[s]):
             raise RuntimeError(f"AF-RR-Funktion '{cfg.af_rr_fn[s]}' fehlt in features.py")
+    if cfg.bcg_mode == 'wavelet' and not hasattr(F, 'bcg_wavelet_feature_block'):
+        raise RuntimeError("bcg_wavelet_feature_block fehlt in features.py")
 
     t0 = time.time()
     cfgd = cfg.as_dict()
