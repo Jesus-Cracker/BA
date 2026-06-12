@@ -94,18 +94,20 @@ class PatientSignals:
         """
         Band-pass each signal. Bands are kept IDENTICAL to signal_alignment_viewer.py
         on purpose: the polarity flags in alignment.json were judged by eye on the
-        viewer's filtered traces, so the loader must reproduce that exact baseline
-        (same band, same cECG auto-flip) before applying the saved invert flags —
-        otherwise an inverted-looking trace in the viewer would not match here.
+        viewer's filtered traces, so the loader reproduces that exact band before
+        applying the saved invert flags. No polarity is inferred here — flips happen
+        only in offset_correction() from alignment.json.
         """
         if self.cecg is not None:
-            # cECG 0.5–35 Hz — same as the viewer (NOT 0.5–20: changing the band
-            # changes the visual polarity baseline the invert flags were set against).
+            # cECG 0.5–35 Hz — same band the viewer used when the invert flags were
+            # judged by eye (NOT 0.5–20: changing the band changes the visual polarity
+            # baseline the flags were set against).
             self.cecg_filt = self.bp_filter(self.cecg, 0.5, 35, fs, order=4)
-            # Heuristic baseline orientation (the viewer applies the SAME flip first;
-            # the alignment.json invert flag is therefore RELATIVE to this).
-            if np.median(self.cecg_filt) > np.mean(self.cecg_filt):
-                self.cecg_filt = -self.cecg_filt
+            # NO heuristic auto-flip. Per project decision, the ONLY polarity flips
+            # applied are the explicit ones stored in alignment.json (applied in
+            # offset_correction() Step 1). Sign must be encoded there, never inferred
+            # from signal statistics — otherwise flips become patient-dependent and
+            # silently inconsistent.
         if self.ppg1 is not None:
             self.ppg1_filt = self.bp_filter(self.ppg1, 0.6, 3.6, fs, order=4)
         if self.ppg2 is not None:
