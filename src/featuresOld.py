@@ -27,7 +27,6 @@ Hinweis zur Reproduzierbarkeit:
 """
 
 from __future__ import annotations
-import warnings
 import numpy as np
 from scipy.stats import skew, kurtosis as scipy_kurtosis
 
@@ -293,16 +292,9 @@ def hrv_heartpy(signal, fs, prefix=''):
     except ImportError:
         raise ImportError("heartpy nicht installiert: pip install heartpy")
     try:
-        # heartpy's internal spline/percentile maths emit RuntimeWarnings on noisy
-        # windows (UnivariateSpline non-convergence, mean-of-empty-slice). They run
-        # inside joblib loky WORKERS, so a main-process warnings filter never reaches
-        # them. We scope-suppress only this third-party call: real failures are still
-        # caught below and turned into None -> NaN features (no window is dropped).
-        with warnings.catch_warnings(), np.errstate(all="ignore"):
-            warnings.simplefilter("ignore")
-            sig = hp.scale_data(signal)
-            wd, m = hp.process(sig, sample_rate=fs, bpmmin=30, bpmmax=220,
-                               reject_segmentwise=True)
+        sig = hp.scale_data(signal)
+        wd, m = hp.process(sig, sample_rate=fs, bpmmin=30, bpmmax=220,
+                           reject_segmentwise=True)
         if np.isnan(m['ibi']) or np.isnan(m['sdnn']):
             return None
         if not (0.27 < m['ibi'] / 1000 < 2.0):
@@ -652,10 +644,8 @@ def _rr_ms_heartpy(signal, fs):
     except ImportError:
         raise ImportError("heartpy nicht installiert: pip install heartpy")
     try:
-        with warnings.catch_warnings(), np.errstate(all="ignore"):
-            warnings.simplefilter("ignore")          # heartpy internals, see hrv_heartpy
-            wd, m = hp.process(hp.scale_data(signal), sample_rate=fs,
-                               bpmmin=30, bpmmax=220, reject_segmentwise=True)
+        wd, m = hp.process(hp.scale_data(signal), sample_rate=fs,
+                           bpmmin=30, bpmmax=220, reject_segmentwise=True)
         rr = np.asarray(wd.get('RR_list_cor', wd.get('RR_list', [])), dtype=float)
         rr = rr[(rr > RR_MIN_MS) & (rr < RR_MAX_MS)]
         return rr if len(rr) >= 4 else None
