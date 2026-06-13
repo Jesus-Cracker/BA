@@ -82,7 +82,7 @@ SQI_KEYS = ['kSQI', 'sSQI', 'pSQI', 'bSQI', 'tSQI', 'composite']
 # Feature-Version: geht in den Cache-Hash ein. Bei JEDER Änderung an der
 # Spaltenstruktur (neue Features) erhöhen -> alte Caches werden NICHT mehr
 # stillschweigend wiederverwendet (verhindert "fehlende Spalten"-Fehler).
-FEAT_VERSION = 'v4_bcg_swt_papr'
+FEAT_VERSION = 'v5_xmodal_xcorr'  # 'v4_bcg_swt_papr'
 
 # Standard-Detektoren je Signal (entsprechen dem bisher besten Stand).
 # Es werden NAMEN (Strings) gespeichert, damit joblib/loky-Worker sie sicher
